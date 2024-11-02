@@ -1,3 +1,11 @@
+[lib]
+name = "compiler"
+path = "src/lib.rs"
+
+[[bin]]
+name = "compiler"
+path = "src/main.rs"
+
 [package]
 name = "compiler"
 version = "0.1.0"

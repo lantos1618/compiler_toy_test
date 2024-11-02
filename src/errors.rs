@@ -1,5 +1,7 @@
 // src/errors.rs
 
+use crate::ast::*;
+
 use thiserror::Error;
 use cranelift_module::ModuleError;
 use cranelift_codegen::CodegenError;
@@ -25,13 +27,13 @@ pub enum CompileError {
     InvalidAssignmentTarget,
 
     #[error("Statement not implemented: {0:?}")]
-    UnimplementedStatement(crate::ast::Stmt),
+    UnimplementedStatement(Stmt),
 
     #[error("Expression not implemented: {0:?}")]
-    UnimplementedExpression(crate::ast::Expr),
+    UnimplementedExpression(Expr),
 
     #[error("Binary operation not implemented: {0:?}")]
-    UnimplementedBinaryOp(crate::ast::BinaryOp),
+    UnimplementedBinaryOp(BinaryOp),
 
     #[error("Cannot create default value for type {0:?}")]
     DefaultValueError(cranelift::prelude::types::Type),

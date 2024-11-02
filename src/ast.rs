@@ -12,14 +12,14 @@ pub struct Program {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Function {
     pub name: String,
-    pub params: Vec<Parameter>,
+    pub params: Vec<Param>,
     pub return_type: AstType,
     pub body: Option<AstBlock>, // None for external functions
     pub external_lib: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct Parameter {
+pub struct Param {
     pub name: String,
     pub typ: AstType,
 }
@@ -148,7 +148,7 @@ pub enum Expr {
         typ: AstType,
     },
     Lambda {
-        params: Vec<Parameter>,
+        params: Vec<Param>,
         return_type: Option<AstType>,
         body: AstBlock,
         captures: Vec<String>,
