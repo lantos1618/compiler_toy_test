@@ -11,14 +11,10 @@ use crate::errors::CompileError;
 
 pub struct CodeGenerator {
     pub module: ObjectModule,
-    builder_context: FunctionBuilderContext,
-    context: codegen::Context,
     functions: HashMap<String, FuncId>,
     variables: HashMap<String, Variable>,
     string_data: HashMap<String, DataId>,
     structs: HashMap<String, StructInfo>,
-    current_function: Option<String>,
-    terminated_blocks: HashSet<Block>,
 }
 
 struct StructInfo {
@@ -27,13 +23,37 @@ struct StructInfo {
     field_types: HashMap<String, AstType>,
 }
 
+struct CodeGenContext {
+    variables: HashMap<String, Variable>,
+    terminated_blocks: HashSet<Block>,
+    current_function: Option<String>,
+}
+
+impl CodeGenContext {
+    fn new() -> Self {
+        Self {
+            variables: HashMap::new(),
+            terminated_blocks: HashSet::new(),
+            current_function: None,
+        }
+    }
+
+    fn mark_block_terminated(&mut self, block: Block) {
+        self.terminated_blocks.insert(block);
+    }
+
+    fn is_block_terminated(&self, block: Block) -> bool {
+        self.terminated_blocks.contains(&block)
+    }
+}
+
 impl CodeGenerator {
     /// Creates a new instance of the code generator.
     pub fn new() -> Result<Self, CompileError> {
         // Set up the target ISA
         let isa_builder = cranelift_native::builder()
             .map_err(|e| CompileError::CraneliftError(e.to_string()))?;
-        let mut flag_builder = settings::builder();
+        let flag_builder = settings::builder();
         // You can set Cranelift flags here if needed
         let flags = settings::Flags::new(flag_builder);
         let isa = isa_builder
@@ -52,14 +72,10 @@ impl CodeGenerator {
 
         Ok(Self {
             module,
-            builder_context: FunctionBuilderContext::new(),
-            context: codegen::Context::new(),
             functions: HashMap::new(),
             variables: HashMap::new(),
             string_data: HashMap::new(),
             structs: HashMap::new(),
-            current_function: None,
-            terminated_blocks: HashSet::new(),
         })
     }
 
@@ -189,29 +205,30 @@ impl CodeGenerator {
             .get(&function.name)
             .ok_or_else(|| CompileError::UndefinedFunction(function.name.clone()))?;
 
-        self.context = self.module.make_context();
         let func_decl = self.module.declarations().get_function_decl(func_id);
-        self.context.func.signature = func_decl.signature.clone();
-        self.terminated_blocks.clear();
 
-        // Create a function builder
-        { 
-            let mut builder =
-                FunctionBuilder::new(&mut self.context.func, &mut self.builder_context);
+        // Create code generation context
+        let mut codegen_ctx = CodeGenContext::new();
+        codegen_ctx.current_function = Some(function.name.clone());
+
+        // Move context and builder_context into local variables
+        let mut context = self.module.make_context();
+        context.func.signature = func_decl.signature.clone();
+
+        {
+            let mut builder_context = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
 
             let entry_block = builder.create_block();
             builder.append_block_params_for_function_params(entry_block);
             builder.switch_to_block(entry_block);
             builder.seal_block(entry_block);
 
-            self.current_function = Some(function.name.clone());
-            self.variables.clear();
-
             // Declare function parameters as variables
             for (i, param) in function.params.iter().enumerate() {
                 let var = Variable::new(i);
+                codegen_ctx.variables.insert(param.name.clone(), var);
                 let ty = self.get_cranelift_type(&param.typ)?;
-                self.variables.insert(param.name.clone(), var);
                 builder.declare_var(var, ty);
 
                 let param_value = builder.block_params(entry_block)[i];
@@ -220,15 +237,15 @@ impl CodeGenerator {
 
             // Generate the function body
             if let Some(body) = &function.body {
-                self.gen_block(&mut builder, body)?;
+                self.gen_block(&mut codegen_ctx, &mut builder, body)?;
             }
 
             // Ensure function ends with a return
             let current_block = builder.current_block().unwrap();
-            if !self.is_block_terminated(current_block) {
+            if !codegen_ctx.is_block_terminated(current_block) {
                 if builder.func.signature.returns.is_empty() {
                     builder.ins().return_(&[]);
-                    self.mark_block_terminated(current_block);
+                    codegen_ctx.mark_block_terminated(current_block);
                 } else {
                     return Err(CompileError::MissingFunctionBody(function.name.clone()));
                 }
@@ -240,9 +257,9 @@ impl CodeGenerator {
 
         // Define the function in the module
         self.module
-            .define_function(func_id, &mut self.context)
+            .define_function(func_id, &mut context)
             .map_err(|e| CompileError::ModuleError(e.into()))?;
-        self.module.clear_context(&mut self.context);
+        self.module.clear_context(&mut context);
 
         Ok(())
     }
@@ -250,11 +267,12 @@ impl CodeGenerator {
     /// Generates code for a block of statements.
     fn gen_block(
         &mut self,
+        ctx: &mut CodeGenContext,
         builder: &mut FunctionBuilder,
         block: &AstBlock,
     ) -> Result<(), CompileError> {
         for stmt in &block.statements {
-            self.gen_statement(builder, stmt)?;
+            self.gen_statement(ctx, builder, stmt)?;
         }
         Ok(())
     }
@@ -262,56 +280,55 @@ impl CodeGenerator {
     /// Generates code for a single statement.
     fn gen_statement(
         &mut self,
+        ctx: &mut CodeGenContext,
         builder: &mut FunctionBuilder,
         stmt: &Stmt,
     ) -> Result<(), CompileError> {
         match stmt {
             Stmt::VarDecl(var_decl) => {
-                // Declare a new variable
-                let var_index = self.variables.len();
+                let var_index = ctx.variables.len();
                 let var = Variable::new(var_index);
-                self.variables.insert(var_decl.name.clone(), var);
+                ctx.variables.insert(var_decl.name.clone(), var);
                 let ty = self.get_cranelift_type(&var_decl.typ)?;
                 builder.declare_var(var, ty);
 
-                // Initialize the variable
                 if let Some(initializer) = &var_decl.initializer {
-                    let value = self.gen_expression(builder, initializer)?;
+                    let value = self.gen_expression(ctx, builder, initializer)?;
                     builder.def_var(var, value);
                 } else {
-                    // Default initialization
                     let zero = self.default_value(builder, ty)?;
                     builder.def_var(var, zero);
                 }
             }
             Stmt::Assignment { target, value } => {
-                let value = self.gen_expression(builder, value)?;
-                self.gen_assignment(builder, target, value)?;
+                let value = self.gen_expression(ctx, builder, value)?;
+                self.gen_assignment(ctx, builder, target, value)?;
             }
             Stmt::Expression(expr) => {
-                self.gen_expression(builder, expr)?;
+                self.gen_expression(ctx, builder, expr)?;
             }
             Stmt::Return(expr_opt) => {
                 let return_values = if let Some(expr) = expr_opt {
-                    let ret_value = self.gen_expression(builder, expr)?;
+                    let ret_value = self.gen_expression(ctx, builder, expr)?;
                     vec![ret_value]
                 } else {
                     vec![]
                 };
                 builder.ins().return_(&return_values);
+                ctx.mark_block_terminated(builder.current_block().unwrap());
             }
             Stmt::If {
                 condition,
                 then_branch,
                 else_branch,
             } => {
-                self.gen_if_statement(builder, condition, then_branch, else_branch)?;
+                self.gen_if_statement(ctx, builder, condition, then_branch, else_branch)?;
             }
             Stmt::While { condition, body } => {
-                self.gen_while_statement(builder, condition, body)?;
+                self.gen_while_statement(ctx, builder, condition, body)?;
             }
             Stmt::Block(block) => {
-                self.gen_block(builder, block)?;
+                self.gen_block(ctx, builder, block)?;
             }
             Stmt::Break => {
                 // Implement break statement
@@ -330,28 +347,29 @@ impl CodeGenerator {
     /// Generates code for an assignment.
     fn gen_assignment(
         &mut self,
+        ctx: &mut CodeGenContext,
         builder: &mut FunctionBuilder,
         target: &Expr,
         value: Value,
     ) -> Result<(), CompileError> {
         match target {
             Expr::Variable(name) => {
-                if let Some(var) = self.variables.get(name) {
+                if let Some(var) = ctx.variables.get(name) {
                     builder.def_var(*var, value);
                 } else {
                     return Err(CompileError::UndefinedVariable(name.clone()));
                 }
             }
             Expr::FieldAccess { expr, field } => {
-                let ptr = self.gen_expression(builder, expr)?;
+                let ptr = self.gen_expression(ctx, builder, expr)?;
                 let field_offset = self.get_field_offset(expr, field)?;
                 let addr = builder.ins().iadd_imm(ptr, field_offset as i64);
                 let mem_flags = MemFlags::new();
                 builder.ins().store(mem_flags, value, addr, 0);
             }
             Expr::ArrayAccess { array, index } => {
-                let base = self.gen_expression(builder, array)?;
-                let idx = self.gen_expression(builder, index)?;
+                let base = self.gen_expression(ctx, builder, array)?;
+                let idx = self.gen_expression(ctx, builder, index)?;
                 let element_size = self.get_element_size(array)?;
                 let offset = builder.ins().imul_imm(idx, element_size as i64);
                 let addr = builder.ins().iadd(base, offset);
@@ -366,37 +384,38 @@ impl CodeGenerator {
     /// Generates code for an if statement.
     fn gen_if_statement(
         &mut self,
+        ctx: &mut CodeGenContext,
         builder: &mut FunctionBuilder,
         condition: &Expr,
         then_branch: &Box<Stmt>,
         else_branch: &Option<Box<Stmt>>,
     ) -> Result<(), CompileError> {
-        let cond_value = self.gen_expression(builder, condition)?;
+        let cond_value = self.gen_expression(ctx, builder, condition)?;
         let then_block = builder.create_block();
         let else_block = builder.create_block();
         let merge_block = builder.create_block();
 
         builder.ins().brif(cond_value, then_block, &[], else_block, &[]);
         let current_block = builder.current_block().unwrap();
-        self.mark_block_terminated(current_block);
+        ctx.mark_block_terminated(current_block);
 
         // Then block
         builder.switch_to_block(then_block);
-        self.gen_statement(builder, then_branch)?;
-        if !self.is_block_terminated(then_block) {
+        self.gen_statement(ctx, builder, then_branch)?;
+        if !ctx.is_block_terminated(then_block) {
             builder.ins().jump(merge_block, &[]);
-            self.mark_block_terminated(then_block);
+            ctx.mark_block_terminated(then_block);
         }
         builder.seal_block(then_block);
 
         // Else block
         builder.switch_to_block(else_block);
         if let Some(else_stmt) = else_branch {
-            self.gen_statement(builder, else_stmt)?;
+            self.gen_statement(ctx, builder, else_stmt)?;
         }
-        if !self.is_block_terminated(else_block) {
+        if !ctx.is_block_terminated(else_block) {
             builder.ins().jump(merge_block, &[]);
-            self.mark_block_terminated(else_block);
+            ctx.mark_block_terminated(else_block);
         }
         builder.seal_block(else_block);
 
@@ -410,6 +429,7 @@ impl CodeGenerator {
     /// Generates code for a while loop.
     fn gen_while_statement(
         &mut self,
+        ctx: &mut CodeGenContext,
         builder: &mut FunctionBuilder,
         condition: &Expr,
         body: &Box<Stmt>,
@@ -420,21 +440,21 @@ impl CodeGenerator {
 
         builder.ins().jump(loop_header, &[]);
         let current_block = builder.current_block().unwrap();
-        self.mark_block_terminated(current_block);
+        ctx.mark_block_terminated(current_block);
 
         // Loop header
         builder.switch_to_block(loop_header);
-        let cond_value = self.gen_expression(builder, condition)?;
+        let cond_value = self.gen_expression(ctx, builder, condition)?;
         builder.ins().brif(cond_value, loop_body, &[], exit_block, &[]);
-        self.mark_block_terminated(loop_header);
+        ctx.mark_block_terminated(loop_header);
         builder.seal_block(loop_header);
 
         // Loop body
         builder.switch_to_block(loop_body);
-        self.gen_statement(builder, body)?;
-        if !self.is_block_terminated(loop_body) {
+        self.gen_statement(ctx, builder, body)?;
+        if !ctx.is_block_terminated(loop_body) {
             builder.ins().jump(loop_header, &[]);
-            self.mark_block_terminated(loop_body);
+            ctx.mark_block_terminated(loop_body);
         }
         builder.seal_block(loop_body);
 
@@ -448,6 +468,7 @@ impl CodeGenerator {
     /// Generates code for an expression and returns the resulting value.
     fn gen_expression(
         &mut self,
+        ctx: &mut CodeGenContext,
         builder: &mut FunctionBuilder,
         expr: &Expr,
     ) -> Result<Value, CompileError> {
@@ -474,26 +495,26 @@ impl CodeGenerator {
                 Ok(builder.ins().symbol_value(self.module.isa().pointer_type(), gv))
             }
             Expr::Variable(name) => {
-                if let Some(var) = self.variables.get(name) {
+                if let Some(var) = ctx.variables.get(name) {
                     Ok(builder.use_var(*var))
                 } else {
                     return Err(CompileError::UndefinedVariable(name.clone()));
                 }
             }
             Expr::Binary { op, left, right } => {
-                let left_val = self.gen_expression(builder, left)?;
-                let right_val = self.gen_expression(builder, right)?;
+                let left_val = self.gen_expression(ctx, builder, left)?;
+                let right_val = self.gen_expression(ctx, builder, right)?;
                 self.gen_binary_op(builder, op.clone(), left_val, right_val)
             }
             Expr::Unary { op, expr } => {
-                let val = self.gen_expression(builder, expr)?;
+                let val = self.gen_expression(ctx, builder, expr)?;
                 self.gen_unary_op(builder, op.clone(), val)
             }
             Expr::Call { function, arguments } => {
-                self.gen_function_call(builder, function, arguments)
+                self.gen_function_call(ctx, builder, function, arguments)
             }
             Expr::FieldAccess { expr, field } => {
-                let ptr = self.gen_expression(builder, expr)?;
+                let ptr = self.gen_expression(ctx, builder, expr)?;
                 let field_offset = self.get_field_offset(expr, field)?;
                 let addr = builder.ins().iadd_imm(ptr, field_offset as i64);
                 let ty = self.get_expr_type(expr)?.clone();
@@ -503,8 +524,8 @@ impl CodeGenerator {
                 Ok(builder.ins().load(cl_type, mem_flags, addr, 0))
             }
             Expr::ArrayAccess { array, index } => {
-                let base = self.gen_expression(builder, array)?;
-                let idx = self.gen_expression(builder, index)?;
+                let base = self.gen_expression(ctx, builder, array)?;
+                let idx = self.gen_expression(ctx, builder, index)?;
                 let element_size = self.get_element_size(array)?;
                 let offset = builder.ins().imul_imm(idx, element_size as i64);
                 let addr = builder.ins().iadd(base, offset);
@@ -514,13 +535,13 @@ impl CodeGenerator {
                 Ok(builder.ins().load(cl_type, mem_flags, addr, 0))
             }
             Expr::StructInit { name, fields } => {
-                self.gen_struct_init(builder, name, fields)
+                self.gen_struct_init(ctx, builder, name, fields)
             }
             Expr::ArrayInit { elements } => {
-                self.gen_array_init(builder, elements)
+                self.gen_array_init(ctx, builder, elements)
             }
             Expr::Cast { expr, typ } => {
-                let val = self.gen_expression(builder, expr)?;
+                let val = self.gen_expression(ctx, builder, expr)?;
                 self.gen_cast(builder, val, typ)
             }
             Expr::Lambda { .. } => Err(CompileError::UnimplementedExpression(expr.clone())),
@@ -547,7 +568,6 @@ impl CodeGenerator {
                 found: format!("{:?}", right_ty),
             });
         }
-
 
         match op {
             BinaryOp::Add => Ok(builder.ins().iadd(left, right)),
@@ -597,14 +617,12 @@ impl CodeGenerator {
         op: UnaryOp,
         val: Value,
     ) -> Result<Value, CompileError> {
-        let val_ty = builder.func.dfg.value_type(val);
-        
         match op {
             UnaryOp::Negate => Ok(builder.ins().ineg(val)),
             UnaryOp::Not => {
                 let zero = builder.ins().iconst(types::I8, 0);
                 let cmp = builder.ins().icmp(IntCC::Equal, val, zero);
-                Ok(builder.ins().bmask(val_ty, cmp))
+                Ok(builder.ins().bmask(types::I8, cmp))
             }
             UnaryOp::BitNot => Ok(builder.ins().bnot(val)),
             _ => Err(CompileError::UnimplementedExpression(Expr::Unary {
@@ -617,6 +635,7 @@ impl CodeGenerator {
     /// Generates code for a function call.
     fn gen_function_call(
         &mut self,
+        ctx: &mut CodeGenContext,
         builder: &mut FunctionBuilder,
         function_expr: &Box<Expr>,
         arguments: &[Expr],
@@ -630,7 +649,7 @@ impl CodeGenerator {
 
             let mut arg_values = Vec::new();
             for arg in arguments {
-                let arg_val = self.gen_expression(builder, arg)?;
+                let arg_val = self.gen_expression(ctx, builder, arg)?;
                 arg_values.push(arg_val);
             }
 
@@ -653,6 +672,7 @@ impl CodeGenerator {
     /// Generates code for struct initialization.
     fn gen_struct_init(
         &mut self,
+        ctx: &mut CodeGenContext,
         builder: &mut FunctionBuilder,
         name: &str,
         fields: &[(String, Expr)],
@@ -681,8 +701,8 @@ impl CodeGenerator {
                     .get(field_name)
                     .ok_or_else(|| CompileError::UndefinedVariable(field_name.clone()))?
             };
-            
-            let value = self.gen_expression(builder, expr)?;
+
+            let value = self.gen_expression(ctx, builder, expr)?;
             let addr = builder.ins().iadd_imm(struct_ptr, field_offset as i64);
             let mem_flags = MemFlags::new();
             builder.ins().store(mem_flags, value, addr, 0);
@@ -694,6 +714,7 @@ impl CodeGenerator {
     /// Generates code for array initialization.
     fn gen_array_init(
         &mut self,
+        ctx: &mut CodeGenContext,
         builder: &mut FunctionBuilder,
         elements: &[Expr],
     ) -> Result<Value, CompileError> {
@@ -711,7 +732,7 @@ impl CodeGenerator {
 
         // Initialize elements
         for (i, expr) in elements.iter().enumerate() {
-            let value = self.gen_expression(builder, expr)?;
+            let value = self.gen_expression(ctx, builder, expr)?;
             let offset = builder.ins().iconst(types::I64, i as i64 * element_size as i64);
             let addr = builder.ins().iadd(array_ptr, offset);
             let mem_flags = MemFlags::new();
@@ -769,7 +790,7 @@ impl CodeGenerator {
                 false, // writable
                 false, // tls
             )?;
-            
+
             let mut data_desc = DataDescription::new();
             data_desc.define(
                 s.as_bytes()
@@ -779,7 +800,7 @@ impl CodeGenerator {
                     .collect::<Vec<u8>>()
                     .into_boxed_slice(),
             );
-            
+
             self.module
                 .define_data(data_id, &data_desc)
                 .map_err(|e| CompileError::ModuleError(e.into()))?;
@@ -939,13 +960,5 @@ impl CodeGenerator {
         } else {
             Err(CompileError::UnsupportedType(format!("{:?}", struct_type)))
         }
-    }
-
-    fn mark_block_terminated(&mut self, block: Block) {
-        self.terminated_blocks.insert(block);
-    }
-
-    fn is_block_terminated(&self, block: Block) -> bool {
-        self.terminated_blocks.contains(&block)
     }
 }
