@@ -108,7 +108,12 @@ impl CodeGenerator {
 
     /// Generates code for the entire program.
     pub fn gen_program(&mut self, program: &Program) -> Result<(), CompileError> {
-        // First, handle structs to get their sizes and field offsets
+        // Handle global variables first
+        for global in &program.globals {
+            self.declare_global(global)?;
+        }
+
+        // Then handle structs to get their sizes and field offsets
         for struct_def in &program.structs {
             self.register_struct(struct_def)?;
         }
@@ -128,11 +133,6 @@ impl CodeGenerator {
             } else {
                 return Err(CompileError::MissingFunctionBody(function.name.clone()));
             }
-        }
-
-        // Handle global variables
-        for global in &program.globals {
-            self.declare_global(global)?;
         }
 
         Ok(())
@@ -215,15 +215,29 @@ impl CodeGenerator {
         let ty = self.get_cranelift_type(&global.typ)?;
         
         if let Some(init) = &global.initializer {
-            let value = self.evaluate_constant_expr(init)?;
-            let bytes = match ty {
-                types::I8 => vec![value as u8],
-                types::I16 => (value as i16).to_le_bytes().to_vec(),
-                types::I32 => (value as i32).to_le_bytes().to_vec(),
-                types::I64 => value.to_le_bytes().to_vec(),
-                _ => return Err(CompileError::UnsupportedType(format!("{:?}", ty))),
-            };
-            desc.define(bytes.into_boxed_slice());
+            match init {
+                Expr::StringLiteral(s) => {
+                    desc.define(
+                        s.as_bytes()
+                            .iter()
+                            .cloned()
+                            .chain(std::iter::once(0)) // Null-terminate
+                            .collect::<Vec<u8>>()
+                            .into_boxed_slice(),
+                    );
+                }
+                _ => {
+                    let value = self.evaluate_constant_expr(init)?;
+                    let bytes = match ty {
+                        types::I8 => vec![value as u8],
+                        types::I16 => (value as i16).to_le_bytes().to_vec(),
+                        types::I32 => (value as i32).to_le_bytes().to_vec(),
+                        types::I64 => value.to_le_bytes().to_vec(),
+                        _ => return Err(CompileError::UnsupportedType(format!("{:?}", ty))),
+                    };
+                    desc.define(bytes.into_boxed_slice());
+                }
+            }
         } else {
             desc.define_zeroinit(ty.bytes() as usize);
         }
@@ -985,7 +999,7 @@ impl CodeGenerator {
             Expr::FloatLiteral(_) => Ok(AstType::Float64),
             Expr::BoolLiteral(_) => Ok(AstType::Boolean),
             Expr::CharLiteral(_) => Ok(AstType::Char),
-            Expr::StringLiteral(_) => Ok(AstType::String),
+            Expr::StringLiteral(_) => Ok(AstType::Pointer(Box::new(AstType::Char))),
             Expr::Variable(name) => {
                 if let Some(var_info) = ctx.get_variable(name) {
                     Ok(var_info.typ.clone())
