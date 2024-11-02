@@ -1,10 +1,14 @@
 // src/codegen.rs
 
 use cranelift::prelude::*;
-use cranelift_codegen::{self, ir::FuncRef, settings};
+use cranelift_codegen::{self, settings};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
+use cranelift_frontend::Variable;
 use std::collections::{HashMap, HashSet};
+
+// Add these new imports
+use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
 
 use crate::ast::*;
 use crate::errors::CompileError;
@@ -12,9 +16,9 @@ use crate::errors::CompileError;
 pub struct CodeGenerator {
     pub module: ObjectModule,
     functions: HashMap<String, FuncId>,
-    variables: HashMap<String, Variable>,
     string_data: HashMap<String, DataId>,
     structs: HashMap<String, StructInfo>,
+    globals: HashMap<String, GlobalVarInfo>,
 }
 
 struct StructInfo {
@@ -24,9 +28,20 @@ struct StructInfo {
 }
 
 struct CodeGenContext {
-    variables: HashMap<String, Variable>,
+    variables: HashMap<String, VarInfo>,
     terminated_blocks: HashSet<Block>,
     current_function: Option<String>,
+    next_var_index: usize,
+}
+
+struct VarInfo {
+    var: Variable,
+    typ: AstType,
+}
+
+struct GlobalVarInfo {
+    data_id: DataId,
+    typ: AstType,
 }
 
 impl CodeGenContext {
@@ -35,7 +50,19 @@ impl CodeGenContext {
             variables: HashMap::new(),
             terminated_blocks: HashSet::new(),
             current_function: None,
+            next_var_index: 0,
         }
+    }
+
+    fn create_variable(&mut self, name: String, typ: AstType) -> Variable {
+        let var = Variable::new(self.next_var_index);
+        self.next_var_index += 1;
+        self.variables.insert(name, VarInfo { var, typ });
+        var
+    }
+
+    fn get_variable(&self, name: &str) -> Option<&VarInfo> {
+        self.variables.get(name)
     }
 
     fn mark_block_terminated(&mut self, block: Block) {
@@ -73,9 +100,9 @@ impl CodeGenerator {
         Ok(Self {
             module,
             functions: HashMap::new(),
-            variables: HashMap::new(),
             string_data: HashMap::new(),
             structs: HashMap::new(),
+            globals: HashMap::new(),
         })
     }
 
@@ -115,21 +142,34 @@ impl CodeGenerator {
     fn register_struct(&mut self, struct_def: &StructDef) -> Result<(), CompileError> {
         let mut field_offsets = HashMap::new();
         let mut field_types = HashMap::new();
-        let mut offset = 0;
+        let mut current_offset = 0;
+
         for field in &struct_def.fields {
-            field_offsets.insert(field.name.clone(), offset);
+            let field_size = self.get_type_size(&field.typ)?;
+            // Add alignment padding if needed
+            let alignment = field_size.min(8); // Maximum 8-byte alignment
+            let padding = (alignment - (current_offset % alignment)) % alignment;
+            current_offset += padding;
+
+            field_offsets.insert(field.name.clone(), current_offset);
             field_types.insert(field.name.clone(), field.typ.clone());
-            let ty_size = self.get_type_size(&field.typ)?;
-            offset += ty_size;
+            current_offset += field_size;
         }
+
+        // Add final padding to align the total size
+        let total_alignment = 8; // Use 8-byte alignment for the whole struct
+        let final_padding = (total_alignment - (current_offset % total_alignment)) % total_alignment;
+        let total_size = current_offset + final_padding;
+
         self.structs.insert(
             struct_def.name.clone(),
             StructInfo {
                 field_offsets,
-                total_size: offset,
                 field_types,
+                total_size,
             },
         );
+
         Ok(())
     }
 
@@ -171,30 +211,28 @@ impl CodeGenerator {
             false, // tls
         )?;
 
-        let mut data_desc = DataDescription::new();
+        let mut desc = DataDescription::new();
         let ty = self.get_cranelift_type(&global.typ)?;
-        let size = ty.bytes() as usize;
-
-        if let Some(initializer) = &global.initializer {
-            // Initialize with given value
-            let value = self.evaluate_constant_expr(initializer)?;
+        
+        if let Some(init) = &global.initializer {
+            let value = self.evaluate_constant_expr(init)?;
             let bytes = match ty {
-                types::I8 => (value as i8).to_le_bytes().to_vec(),
+                types::I8 => vec![value as u8],
                 types::I16 => (value as i16).to_le_bytes().to_vec(),
                 types::I32 => (value as i32).to_le_bytes().to_vec(),
                 types::I64 => value.to_le_bytes().to_vec(),
                 _ => return Err(CompileError::UnsupportedType(format!("{:?}", ty))),
             };
-            data_desc.define(bytes.into_boxed_slice());
+            desc.define(bytes.into_boxed_slice());
         } else {
-            // Zero-initialized data
-            data_desc.define_zeroinit(size);
+            desc.define_zeroinit(ty.bytes() as usize);
         }
 
-        self.module
-            .define_data(data_id, &data_desc)
-            .map_err(|e| CompileError::ModuleError(e.into()))?;
-
+        self.module.define_data(data_id, &desc)?;
+        self.globals.insert(global.name.clone(), GlobalVarInfo {
+            data_id,
+            typ: global.typ.clone(),
+        });
         Ok(())
     }
 
@@ -226,8 +264,7 @@ impl CodeGenerator {
 
             // Declare function parameters as variables
             for (i, param) in function.params.iter().enumerate() {
-                let var = Variable::new(i);
-                codegen_ctx.variables.insert(param.name.clone(), var);
+                let var = codegen_ctx.create_variable(param.name.clone(), param.typ.clone());
                 let ty = self.get_cranelift_type(&param.typ)?;
                 builder.declare_var(var, ty);
 
@@ -286,17 +323,22 @@ impl CodeGenerator {
     ) -> Result<(), CompileError> {
         match stmt {
             Stmt::VarDecl(var_decl) => {
-                let var_index = ctx.variables.len();
-                let var = Variable::new(var_index);
-                ctx.variables.insert(var_decl.name.clone(), var);
-                let ty = self.get_cranelift_type(&var_decl.typ)?;
-                builder.declare_var(var, ty);
+                let var = ctx.create_variable(var_decl.name.clone(), var_decl.typ.clone());
+                let _ty = self.get_cranelift_type(&var_decl.typ)?;
+                builder.declare_var(var, _ty);
 
                 if let Some(initializer) = &var_decl.initializer {
+                    let init_type = self.get_expr_type(ctx, initializer)?;
+                    if init_type != var_decl.typ {
+                        return Err(CompileError::TypeMismatch {
+                            expected: format!("{:?}", var_decl.typ),
+                            found: format!("{:?}", init_type),
+                        });
+                    }
                     let value = self.gen_expression(ctx, builder, initializer)?;
                     builder.def_var(var, value);
                 } else {
-                    let zero = self.default_value(builder, ty)?;
+                    let zero = self.default_value(builder, _ty)?;
                     builder.def_var(var, zero);
                 }
             }
@@ -354,15 +396,32 @@ impl CodeGenerator {
     ) -> Result<(), CompileError> {
         match target {
             Expr::Variable(name) => {
-                if let Some(var) = ctx.variables.get(name) {
-                    builder.def_var(*var, value);
+                let value_type = self.get_expr_type(ctx, &Expr::Variable(name.clone()))?;
+                let target_type = builder.func.dfg.value_type(value);
+                let expected_type = self.get_cranelift_type(&value_type)?;
+                
+                if expected_type != target_type {
+                    return Err(CompileError::TypeMismatch {
+                        expected: format!("{:?}", expected_type),
+                        found: format!("{:?}", target_type),
+                    });
+                }
+
+                if let Some(var_info) = ctx.get_variable(name) {
+                    builder.def_var(var_info.var, value);
+                } else if let Some(global_info) = self.globals.get(name) {
+                    let data_id = global_info.data_id;
+                    let gv = self.module.declare_data_in_func(data_id, &mut builder.func);
+                    let ptr = builder.ins().symbol_value(self.module.isa().pointer_type(), gv);
+                    let mem_flags = MemFlags::new();
+                    builder.ins().store(mem_flags, value, ptr, 0);
                 } else {
                     return Err(CompileError::UndefinedVariable(name.clone()));
                 }
             }
             Expr::FieldAccess { expr, field } => {
                 let ptr = self.gen_expression(ctx, builder, expr)?;
-                let field_offset = self.get_field_offset(expr, field)?;
+                let field_offset = self.get_field_offset(ctx, expr, field)?;
                 let addr = builder.ins().iadd_imm(ptr, field_offset as i64);
                 let mem_flags = MemFlags::new();
                 builder.ins().store(mem_flags, value, addr, 0);
@@ -370,7 +429,7 @@ impl CodeGenerator {
             Expr::ArrayAccess { array, index } => {
                 let base = self.gen_expression(ctx, builder, array)?;
                 let idx = self.gen_expression(ctx, builder, index)?;
-                let element_size = self.get_element_size(array)?;
+                let element_size = self.get_element_size(ctx, array)?;
                 let offset = builder.ins().imul_imm(idx, element_size as i64);
                 let addr = builder.ins().iadd(base, offset);
                 let mem_flags = MemFlags::new();
@@ -495,10 +554,17 @@ impl CodeGenerator {
                 Ok(builder.ins().symbol_value(self.module.isa().pointer_type(), gv))
             }
             Expr::Variable(name) => {
-                if let Some(var) = ctx.variables.get(name) {
-                    Ok(builder.use_var(*var))
+                if let Some(var_info) = ctx.get_variable(name) {
+                    Ok(builder.use_var(var_info.var))
+                } else if let Some(global_info) = self.globals.get(name) {
+                    let data_id = global_info.data_id;
+                    let gv = self.module.declare_data_in_func(data_id, &mut builder.func);
+                    let ptr = builder.ins().symbol_value(self.module.isa().pointer_type(), gv);
+                    let ty = self.get_cranelift_type(&global_info.typ)?;
+                    let mem_flags = MemFlags::new();
+                    Ok(builder.ins().load(ty, mem_flags, ptr, 0))
                 } else {
-                    return Err(CompileError::UndefinedVariable(name.clone()));
+                    Err(CompileError::UndefinedVariable(name.clone()))
                 }
             }
             Expr::Binary { op, left, right } => {
@@ -515,9 +581,9 @@ impl CodeGenerator {
             }
             Expr::FieldAccess { expr, field } => {
                 let ptr = self.gen_expression(ctx, builder, expr)?;
-                let field_offset = self.get_field_offset(expr, field)?;
+                let field_offset = self.get_field_offset(ctx, expr, field)?;
                 let addr = builder.ins().iadd_imm(ptr, field_offset as i64);
-                let ty = self.get_expr_type(expr)?.clone();
+                let ty = self.get_expr_type(ctx, expr)?.clone();
                 let field_type = self.get_field_type(&ty, field)?;
                 let cl_type = self.get_cranelift_type(&field_type)?;
                 let mem_flags = MemFlags::new();
@@ -526,10 +592,10 @@ impl CodeGenerator {
             Expr::ArrayAccess { array, index } => {
                 let base = self.gen_expression(ctx, builder, array)?;
                 let idx = self.gen_expression(ctx, builder, index)?;
-                let element_size = self.get_element_size(array)?;
+                let element_size = self.get_element_size(ctx, array)?;
                 let offset = builder.ins().imul_imm(idx, element_size as i64);
                 let addr = builder.ins().iadd(base, offset);
-                let element_type = self.get_element_type(array)?;
+                let element_type = self.get_element_type(ctx, array)?;
                 let cl_type = self.get_cranelift_type(&element_type)?;
                 let mem_flags = MemFlags::new();
                 Ok(builder.ins().load(cl_type, mem_flags, addr, 0))
@@ -686,11 +752,15 @@ impl CodeGenerator {
             struct_info.total_size as i64
         };
 
-        // Allocate memory
-        let size = builder.ins().iconst(types::I64, total_size);
-        let malloc = self.get_malloc(builder)?;
-        let call = builder.ins().call(malloc, &[size]);
-        let struct_ptr = builder.inst_results(call)[0];
+        // Allocate stack slot with alignment
+        let struct_slot = builder.create_sized_stack_slot(
+            StackSlotData::new(StackSlotKind::ExplicitSlot, total_size as u32, 8),
+        );
+        let struct_ptr = builder.ins().stack_addr(
+            self.module.isa().pointer_type(),
+            struct_slot,
+            0,
+        );
 
         // Initialize fields
         for (field_name, expr) in fields {
@@ -701,10 +771,10 @@ impl CodeGenerator {
                     .get(field_name)
                     .ok_or_else(|| CompileError::UndefinedVariable(field_name.clone()))?
             };
-
+            
             let value = self.gen_expression(ctx, builder, expr)?;
             let addr = builder.ins().iadd_imm(struct_ptr, field_offset as i64);
-            let mem_flags = MemFlags::new();
+            let mem_flags = MemFlags::trusted();
             builder.ins().store(mem_flags, value, addr, 0);
         }
 
@@ -719,23 +789,29 @@ impl CodeGenerator {
         elements: &[Expr],
     ) -> Result<Value, CompileError> {
         let element_count = elements.len() as i64;
-        let element_type = self.get_expr_type(&elements[0])?;
+        let element_type = self.get_expr_type(ctx, &elements[0])?;
         let element_size = self.get_type_size(&element_type)?;
 
-        // Allocate space for the array
+        // Allocate stack slot with alignment
         let total_size = element_count * element_size as i64;
-        let size = builder.ins().iconst(types::I64, total_size);
-        let malloc = self.get_malloc(builder)?;
-        let call = builder.ins().call(malloc, &[size]);
-        let results = builder.inst_results(call);
-        let array_ptr = results[0];
+        let array_slot = builder.create_sized_stack_slot(
+            StackSlotData::new(StackSlotKind::ExplicitSlot, total_size as u32, 8),
+        );
+        let array_ptr = builder.ins().stack_addr(
+            self.module.isa().pointer_type(),
+            array_slot,
+            0,
+        );
 
         // Initialize elements
         for (i, expr) in elements.iter().enumerate() {
             let value = self.gen_expression(ctx, builder, expr)?;
-            let offset = builder.ins().iconst(types::I64, i as i64 * element_size as i64);
+            let offset = builder.ins().iconst(
+                self.module.isa().pointer_type(),
+                i as i64 * element_size as i64,
+            );
             let addr = builder.ins().iadd(array_ptr, offset);
-            let mem_flags = MemFlags::new();
+            let mem_flags = MemFlags::trusted();
             builder.ins().store(mem_flags, value, addr, 0);
         }
 
@@ -791,8 +867,8 @@ impl CodeGenerator {
                 false, // tls
             )?;
 
-            let mut data_desc = DataDescription::new();
-            data_desc.define(
+            let mut desc = DataDescription::new();
+            desc.define(
                 s.as_bytes()
                     .iter()
                     .cloned()
@@ -802,7 +878,7 @@ impl CodeGenerator {
             );
 
             self.module
-                .define_data(data_id, &data_desc)
+                .define_data(data_id, &desc)
                 .map_err(|e| CompileError::ModuleError(e.into()))?;
             self.string_data.insert(s.to_string(), data_id);
             Ok(data_id)
@@ -877,8 +953,13 @@ impl CodeGenerator {
     }
 
     /// Gets the field offset within a struct.
-    fn get_field_offset(&self, expr: &Expr, field: &str) -> Result<i32, CompileError> {
-        if let AstType::Struct(name) = self.get_expr_type(expr)? {
+    fn get_field_offset(
+        &self,
+        ctx: &CodeGenContext,
+        expr: &Expr,
+        field: &str,
+    ) -> Result<i32, CompileError> {
+        if let AstType::Struct(name) = self.get_expr_type(ctx, expr)? {
             let struct_info = self
                 .structs
                 .get(&name)
@@ -894,31 +975,101 @@ impl CodeGenerator {
     }
 
     /// Gets the type of an expression.
-    fn get_expr_type(&self, expr: &Expr) -> Result<AstType, CompileError> {
-        // Implement type inference or tracking as needed
-        Err(CompileError::UnimplementedExpression(expr.clone()))
-    }
-
-    /// Gets the malloc function reference.
-    fn get_malloc(
-        &mut self,
-        builder: &mut FunctionBuilder,
-    ) -> Result<FuncRef, CompileError> {
-        let mut signature = self.module.make_signature();
-        signature.params.push(AbiParam::new(types::I64));
-        signature
-            .returns
-            .push(AbiParam::new(self.module.isa().pointer_type()));
-
-        let malloc_id = self
-            .module
-            .declare_function("malloc", Linkage::Import, &signature)?;
-        Ok(self.module.declare_func_in_func(malloc_id, &mut builder.func))
+    fn get_expr_type(
+        &self,
+        ctx: &CodeGenContext,
+        expr: &Expr,
+    ) -> Result<AstType, CompileError> {
+        match expr {
+            Expr::IntLiteral(_) => Ok(AstType::Int64),
+            Expr::FloatLiteral(_) => Ok(AstType::Float64),
+            Expr::BoolLiteral(_) => Ok(AstType::Boolean),
+            Expr::CharLiteral(_) => Ok(AstType::Char),
+            Expr::StringLiteral(_) => Ok(AstType::String),
+            Expr::Variable(name) => {
+                if let Some(var_info) = ctx.get_variable(name) {
+                    Ok(var_info.typ.clone())
+                } else if let Some(global_info) = self.globals.get(name) {
+                    Ok(global_info.typ.clone())
+                } else {
+                    Err(CompileError::UndefinedVariable(name.clone()))
+                }
+            }
+            Expr::ArrayAccess { array, .. } => {
+                if let AstType::Array(element_type, _) = self.get_expr_type(ctx, array)? {
+                    Ok(*element_type)
+                } else {
+                    Err(CompileError::UnsupportedType("Not an array type".to_string()))
+                }
+            }
+            Expr::FieldAccess { expr, field } => {
+                if let AstType::Struct(struct_name) = self.get_expr_type(ctx, expr)? {
+                    if let Some(struct_info) = self.structs.get(&struct_name) {
+                        if let Some(field_type) = struct_info.field_types.get(field) {
+                            Ok(field_type.clone())
+                        } else {
+                            Err(CompileError::UndefinedVariable(field.clone()))
+                        }
+                    } else {
+                        Err(CompileError::UnsupportedType(format!("Unknown struct '{}'", struct_name)))
+                    }
+                } else {
+                    Err(CompileError::UnsupportedType("Not a struct type".to_string()))
+                }
+            }
+            Expr::Binary { left, .. } => {
+                // For now, assume binary operations return the same type as their left operand
+                self.get_expr_type(ctx, left)
+            }
+            Expr::Unary { expr, .. } => {
+                // Unary operations generally preserve their operand type
+                self.get_expr_type(ctx, expr)
+            }
+            Expr::Cast { typ, .. } => {
+                // Cast expressions have an explicit type
+                Ok(typ.clone())
+            }
+            Expr::Call { function, .. } => {
+                // Look up the function's return type
+                if let Expr::Variable(func_name) = function.as_ref() {
+                    if let Some(func_id) = self.functions.get(func_name) {
+                        let func_decl = self.module.declarations().get_function_decl(*func_id);
+                        if !func_decl.signature.returns.is_empty() {
+                            // Convert ABI type back to AST type
+                            // This is a simplification - you might need more sophisticated mapping
+                            Ok(AstType::Int64) // Default to Int64 for now
+                        } else {
+                            Ok(AstType::Void)
+                        }
+                    } else {
+                        Err(CompileError::UndefinedFunction(func_name.clone()))
+                    }
+                } else {
+                    Err(CompileError::UnimplementedExpression((**function).clone()))
+                }
+            }
+            Expr::StructInit { name, .. } => Ok(AstType::Struct(name.clone())),
+            Expr::ArrayInit { elements } => {
+                if elements.is_empty() {
+                    Err(CompileError::UnsupportedType("Empty array".to_string()))
+                } else {
+                    let element_type = self.get_expr_type(ctx, &elements[0])?;
+                    Ok(AstType::Array(Box::new(element_type), elements.len()))
+                }
+            }
+            Expr::StringLiteral(_) => Ok(AstType::Pointer(Box::new(AstType::Char))),
+            Expr::Lambda { .. } => Err(CompileError::UnimplementedExpression(expr.clone())),
+            _ => Err(CompileError::UnimplementedExpression(expr.clone())),
+        }
     }
 
     /// Gets the element size of an array.
-    fn get_element_size(&self, array_expr: &Expr) -> Result<i32, CompileError> {
-        let array_type = self.get_expr_type(array_expr)?;
+    fn get_element_size(
+        &self,
+        ctx: &CodeGenContext,
+        array_expr: &Expr,
+    ) -> Result<i32, CompileError> {
+        let array_type = self.get_expr_type(ctx, array_expr)?;
         if let AstType::Array(element_type, _) = array_type {
             self.get_type_size(&element_type)
         } else {
@@ -930,8 +1081,12 @@ impl CodeGenerator {
     }
 
     /// Gets the element type of an array.
-    fn get_element_type(&self, array_expr: &Expr) -> Result<AstType, CompileError> {
-        let array_type = self.get_expr_type(array_expr)?;
+    fn get_element_type(
+        &self,
+        ctx: &CodeGenContext,
+        array_expr: &Expr,
+    ) -> Result<AstType, CompileError> {
+        let array_type = self.get_expr_type(ctx, array_expr)?;
         if let AstType::Array(element_type, _) = array_type {
             Ok(*element_type)
         } else {
@@ -962,3 +1117,11 @@ impl CodeGenerator {
         }
     }
 }
+
+#[derive(Clone)]
+struct VariableInfo {
+    typ: AstType,
+    var: Variable,
+}
+
+

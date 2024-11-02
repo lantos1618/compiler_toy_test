@@ -46,6 +46,7 @@ dependencies = [
  "compiler",
  "cranelift",
  "cranelift-codegen",
+ "cranelift-frontend",
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
