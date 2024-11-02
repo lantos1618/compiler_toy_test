@@ -154,7 +154,8 @@ impl CodeGenerator {
             let symbol_name = if lib_name.is_empty() {
                 function.name.clone()
             } else {
-                format!("{}_{}", lib_name, function.name)
+                function.name.clone()
+                // format!("{}_{}", lib_name, function.name)
             };
             
             // Declare the function with the proper symbol name based on module type
@@ -247,17 +248,68 @@ impl CodeGenerator {
         let func_id = *self.functions.get(&function.name)
             .ok_or_else(|| CompileError::UndefinedFunction(function.name.clone()))?;
 
+        let func_decl = match &self.module {
+            CompilerModule::JIT(m) => m.declarations().get_function_decl(func_id),
+            CompilerModule::Object(m) => m.declarations().get_function_decl(func_id),
+        };
+
+        // Create code generation context
+        let mut codegen_ctx = CodeGenContext::new();
+        codegen_ctx.current_function = Some(function.name.clone());
+
+        // Create context and builder
+        let mut context = self.module.make_context();
+        context.func.signature = func_decl.signature.clone();
+
+        let mut builder_context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
+
+        // Create and set up the entry block
+        let entry_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+        builder.switch_to_block(entry_block);
+
+        // Declare function parameters as variables
+        for (i, param) in function.params.iter().enumerate() {
+            let var = codegen_ctx.create_variable(param.name.clone(), param.typ.clone());
+            let ty = self.get_cranelift_type(&param.typ)?;
+            builder.declare_var(var, ty);
+
+            let param_value = builder.block_params(entry_block)[i];
+            builder.def_var(var, param_value);
+        }
+
+        // Generate the function body
+        if let Some(body) = &function.body {
+            self.gen_block(&mut codegen_ctx, &mut builder, body)?;
+        }
+
+        // Ensure function ends with a return
+        let current_block = builder.current_block().unwrap();
+        if !codegen_ctx.is_block_terminated(current_block) {
+            if builder.func.signature.returns.is_empty() {
+                builder.ins().return_(&[]);
+                codegen_ctx.mark_block_terminated(current_block);
+            } else {
+                return Err(CompileError::MissingFunctionBody(function.name.clone()));
+            }
+        }
+
+        // Seal all blocks and finalize
+        builder.seal_block(entry_block); // Seal entry block explicitly
+        builder.seal_all_blocks();
+        builder.finalize();
+
+        // Define the function in the module
         match &mut self.module {
             CompilerModule::JIT(m) => {
-                let mut context = m.make_context();
-                // ... rest of function definition logic ...
-                m.define_function(func_id, &mut context)?;
+                m.define_function(func_id, &mut context)
+                    .map_err(|e| CompileError::ModuleError(e.into()))?;
                 m.clear_context(&mut context);
             }
             CompilerModule::Object(m) => {
-                let mut context = m.make_context();
-                // ... rest of function definition logic ...
-                m.define_function(func_id, &mut context)?;
+                m.define_function(func_id, &mut context)
+                    .map_err(|e| CompileError::ModuleError(e.into()))?;
                 m.clear_context(&mut context);
             }
         }
@@ -457,33 +509,38 @@ impl CodeGenerator {
         condition: &Expr,
         body: &Box<Stmt>,
     ) -> Result<(), CompileError> {
-        let loop_header = builder.create_block();
-        let loop_body = builder.create_block();
+        // Create the required blocks
+        let header_block = builder.create_block();
+        let body_block = builder.create_block();
         let exit_block = builder.create_block();
 
-        builder.ins().jump(loop_header, &[]);
+        // Jump to the header block first
+        builder.ins().jump(header_block, &[]);
         let current_block = builder.current_block().unwrap();
         ctx.mark_block_terminated(current_block);
 
-        // Loop header
-        builder.switch_to_block(loop_header);
+        // Generate header block (condition evaluation)
+        builder.switch_to_block(header_block);
         let cond_value = self.gen_expression(ctx, builder, condition)?;
-        builder.ins().brif(cond_value, loop_body, &[], exit_block, &[]);
-        ctx.mark_block_terminated(loop_header);
-        builder.seal_block(loop_header);
+        builder.ins().brif(cond_value, body_block, &[], exit_block, &[]);
+        ctx.mark_block_terminated(header_block);
 
-        // Loop body
-        builder.switch_to_block(loop_body);
+        // Generate body block
+        builder.switch_to_block(body_block);
         self.gen_statement(ctx, builder, body)?;
-        if !ctx.is_block_terminated(loop_body) {
-            builder.ins().jump(loop_header, &[]);
-            ctx.mark_block_terminated(loop_body);
+        // Jump back to header if not already terminated
+        if !ctx.is_block_terminated(body_block) {
+            builder.ins().jump(header_block, &[]);
+            ctx.mark_block_terminated(body_block);
         }
-        builder.seal_block(loop_body);
 
-        // Exit block
+        // Switch to exit block
         builder.switch_to_block(exit_block);
-        builder.seal_block(exit_block);
+
+        // Important: Seal blocks in the correct order
+        builder.seal_block(header_block); // Header can be sealed after body is done
+        builder.seal_block(body_block);   // Body can be sealed after it's generated
+        builder.seal_block(exit_block);   // Exit block can be sealed last
 
         Ok(())
     }

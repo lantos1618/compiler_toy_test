@@ -494,4 +494,82 @@ fn test_error_handling_type_mismatch() {
     let result = compile_and_run(&program);
     assert!(result.is_err());
 }
+
+#[test]
+fn test_while_loop() {
+    // Test a simple while loop that counts to 5
+    // int main() { 
+    //     int i = 0;
+    //     int sum = 0;
+    //     while (i < 5) {
+    //         sum = sum + i;
+    //         i = i + 1;
+    //     }
+    //     return sum;
+    // }
+    let program = Program {
+        structs: vec![],
+        functions: vec![Function {
+            name: "main".to_string(),
+            params: vec![],
+            return_type: AstType::Int64,
+            body: Some(AstBlock {
+                statements: vec![
+                    // Initialize i = 0
+                    Stmt::VarDecl(VarDecl {
+                        name: "i".to_string(),
+                        typ: AstType::Int64,
+                        initializer: Some(Expr::IntLiteral(0)),
+                        is_mutable: true,
+                    }),
+                    // Initialize sum = 0
+                    Stmt::VarDecl(VarDecl {
+                        name: "sum".to_string(),
+                        typ: AstType::Int64,
+                        initializer: Some(Expr::IntLiteral(0)),
+                        is_mutable: true,
+                    }),
+                    // while (i < 5)
+                    Stmt::While {
+                        condition: Expr::Binary {
+                            op: BinaryOp::LessThan,
+                            left: Box::new(Expr::Variable("i".to_string())),
+                            right: Box::new(Expr::IntLiteral(5)),
+                        },
+                        body: Box::new(Stmt::Block(AstBlock {
+                            statements: vec![
+                                // sum = sum + i
+                                Stmt::Assignment {
+                                    target: Expr::Variable("sum".to_string()),
+                                    value: Expr::Binary {
+                                        op: BinaryOp::Add,
+                                        left: Box::new(Expr::Variable("sum".to_string())),
+                                        right: Box::new(Expr::Variable("i".to_string())),
+                                    },
+                                },
+                                // i = i + 1
+                                Stmt::Assignment {
+                                    target: Expr::Variable("i".to_string()),
+                                    value: Expr::Binary {
+                                        op: BinaryOp::Add,
+                                        left: Box::new(Expr::Variable("i".to_string())),
+                                        right: Box::new(Expr::IntLiteral(1)),
+                                    },
+                                },
+                            ],
+                        })),
+                    },
+                    // return sum
+                    Stmt::Return(Some(Expr::Variable("sum".to_string()))),
+                ],
+            }),
+            external_lib: None,
+        }],
+        globals: vec![],
+    };
+
+    let result = compile_and_run(&program);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), 10); // 0 + 1 + 2 + 3 + 4 = 10
+}
 }
