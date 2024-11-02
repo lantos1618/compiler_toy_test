@@ -509,38 +509,46 @@ impl CodeGenerator {
         condition: &Expr,
         body: &Box<Stmt>,
     ) -> Result<(), CompileError> {
-        // Create the required blocks
-        let header_block = builder.create_block();
-        let body_block = builder.create_block();
-        let exit_block = builder.create_block();
+        // 1. Create blocks for the loop structure
+        let header_block = builder.create_block();  // Condition evaluation
+        let body_block = builder.create_block();    // Loop body
+        let follow_block = builder.create_block();  // Code after the loop
 
-        // Jump to the header block first
+        // 2. Branch from current block to loop header
         builder.ins().jump(header_block, &[]);
-        let current_block = builder.current_block().unwrap();
-        ctx.mark_block_terminated(current_block);
+        let entry_block = builder.current_block().unwrap();
+        ctx.mark_block_terminated(entry_block);
 
-        // Generate header block (condition evaluation)
+        // 3. Generate loop header (condition check)
         builder.switch_to_block(header_block);
         let cond_value = self.gen_expression(ctx, builder, condition)?;
-        builder.ins().brif(cond_value, body_block, &[], exit_block, &[]);
+        builder.ins().brif(cond_value, body_block, &[], follow_block, &[]);
         ctx.mark_block_terminated(header_block);
 
-        // Generate body block
+        // 4. Generate loop body
         builder.switch_to_block(body_block);
         self.gen_statement(ctx, builder, body)?;
-        // Jump back to header if not already terminated
+        
+        // If body block isn't already terminated (e.g., by a return),
+        // jump back to header for next iteration
         if !ctx.is_block_terminated(body_block) {
             builder.ins().jump(header_block, &[]);
             ctx.mark_block_terminated(body_block);
         }
 
-        // Switch to exit block
-        builder.switch_to_block(exit_block);
+        // 5. Move to the follow block for code after the loop
+        builder.switch_to_block(follow_block);
+        // Add a placeholder instruction to satisfy Cranelift
+        let zero = builder.ins().iconst(types::I64, 0);
+        builder.ins().iconst(types::I64, 0);
 
-        // Important: Seal blocks in the correct order
-        builder.seal_block(header_block); // Header can be sealed after body is done
-        builder.seal_block(body_block);   // Body can be sealed after it's generated
-        builder.seal_block(exit_block);   // Exit block can be sealed last
+        // 6. Seal blocks in correct order:
+        // - Body can see the header
+        // - Header can see the entry and body blocks
+        // - Follow block can see the header
+        builder.seal_block(body_block);    // Seal body first
+        builder.seal_block(header_block);  // Then header
+        builder.seal_block(follow_block);  // Finally follow block
 
         Ok(())
     }

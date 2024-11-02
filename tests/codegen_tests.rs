@@ -572,4 +572,211 @@ fn test_while_loop() {
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), 10); // 0 + 1 + 2 + 3 + 4 = 10
 }
+#[test]
+fn test_nested_while_loops() {
+    // Tests nested while loops
+    // int main() {
+    //     int i = 0, j = 0, sum = 0;
+    //     while (i < 3) {
+    //         j = 0;
+    //         while (j < 2) {
+    //             sum = sum + (i * j);
+    //             j = j + 1;
+    //         }
+    //         i = i + 1;
+    //     }
+    //     return sum;
+    // }
+    let program = Program {
+        structs: vec![],
+        functions: vec![Function {
+            name: "main".to_string(),
+            params: vec![],
+            return_type: AstType::Int64,
+            body: Some(AstBlock {
+                statements: vec![
+                    // Initialize variables
+                    Stmt::VarDecl(VarDecl {
+                        name: "i".to_string(),
+                        typ: AstType::Int64,
+                        initializer: Some(Expr::IntLiteral(0)),
+                        is_mutable: true,
+                    }),
+                    Stmt::VarDecl(VarDecl {
+                        name: "j".to_string(),
+                        typ: AstType::Int64,
+                        initializer: Some(Expr::IntLiteral(0)),
+                        is_mutable: true,
+                    }),
+                    Stmt::VarDecl(VarDecl {
+                        name: "sum".to_string(),
+                        typ: AstType::Int64,
+                        initializer: Some(Expr::IntLiteral(0)),
+                        is_mutable: true,
+                    }),
+                    // Outer while loop
+                    Stmt::While {
+                        condition: Expr::Binary {
+                            op: BinaryOp::LessThan,
+                            left: Box::new(Expr::Variable("i".to_string())),
+                            right: Box::new(Expr::IntLiteral(3)),
+                        },
+                        body: Box::new(Stmt::Block(AstBlock {
+                            statements: vec![
+                                // Reset j
+                                Stmt::Assignment {
+                                    target: Expr::Variable("j".to_string()),
+                                    value: Expr::IntLiteral(0),
+                                },
+                                // Inner while loop
+                                Stmt::While {
+                                    condition: Expr::Binary {
+                                        op: BinaryOp::LessThan,
+                                        left: Box::new(Expr::Variable("j".to_string())),
+                                        right: Box::new(Expr::IntLiteral(2)),
+                                    },
+                                    body: Box::new(Stmt::Block(AstBlock {
+                                        statements: vec![
+                                            // sum += i * j
+                                            Stmt::Assignment {
+                                                target: Expr::Variable("sum".to_string()),
+                                                value: Expr::Binary {
+                                                    op: BinaryOp::Add,
+                                                    left: Box::new(Expr::Variable("sum".to_string())),
+                                                    right: Box::new(Expr::Binary {
+                                                        op: BinaryOp::Multiply,
+                                                        left: Box::new(Expr::Variable("i".to_string())),
+                                                        right: Box::new(Expr::Variable("j".to_string())),
+                                                    }),
+                                                },
+                                            },
+                                            // j++
+                                            Stmt::Assignment {
+                                                target: Expr::Variable("j".to_string()),
+                                                value: Expr::Binary {
+                                                    op: BinaryOp::Add,
+                                                    left: Box::new(Expr::Variable("j".to_string())),
+                                                    right: Box::new(Expr::IntLiteral(1)),
+                                                },
+                                            },
+                                        ],
+                                    })),
+                                },
+                                // i++
+                                Stmt::Assignment {
+                                    target: Expr::Variable("i".to_string()),
+                                    value: Expr::Binary {
+                                        op: BinaryOp::Add,
+                                        left: Box::new(Expr::Variable("i".to_string())),
+                                        right: Box::new(Expr::IntLiteral(1)),
+                                    },
+                                },
+                            ],
+                        })),
+                    },
+                    // Return sum
+                    Stmt::Return(Some(Expr::Variable("sum".to_string()))),
+                ],
+            }),
+            external_lib: None,
+        }],
+        globals: vec![],
+    };
+
+    let result = compile_and_run(&program);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), 3); // Corrected expected result
+}
+
+#[test]
+fn test_external_function_call() {
+    // Tests calling an external function (like puts)
+    let program = Program {
+        structs: vec![],
+        functions: vec![
+            // Declare external puts function
+            Function {
+                name: "puts".to_string(),
+                params: vec![Param {
+                    name: "s".to_string(),
+                    typ: AstType::Pointer(Box::new(AstType::Int8)),
+                }],
+                return_type: AstType::Int32,
+                body: None,
+                external_lib: Some("c".to_string()),
+            },
+            // Main function that calls puts
+            Function {
+                name: "main".to_string(),
+                params: vec![],
+                return_type: AstType::Int64,
+                body: Some(AstBlock {
+                    statements: vec![
+                        Stmt::Expression(Expr::Call {
+                            function: Box::new(Expr::Variable("puts".to_string())),
+                            arguments: vec![Expr::StringLiteral("Hello, World!".to_string())],
+                        }),
+                        Stmt::Return(Some(Expr::IntLiteral(0))),
+                    ],
+                }),
+                external_lib: None,
+            },
+        ],
+        globals: vec![],
+    };
+
+    let result = compile_and_run(&program);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_complex_arithmetic() {
+    // Tests more complex arithmetic expressions with operator precedence
+    // int main() {
+    //     return (2 + 3 * 4) / 2 - (5 % 3) * 2;
+    // }
+    let program = Program {
+        structs: vec![],
+        functions: vec![Function {
+            name: "main".to_string(),
+            params: vec![],
+            return_type: AstType::Int64,
+            body: Some(AstBlock {
+                statements: vec![
+                    Stmt::Return(Some(Expr::Binary {
+                        op: BinaryOp::Subtract,
+                        left: Box::new(Expr::Binary {
+                            op: BinaryOp::Divide,
+                            left: Box::new(Expr::Binary {
+                                op: BinaryOp::Add,
+                                left: Box::new(Expr::IntLiteral(2)),
+                                right: Box::new(Expr::Binary {
+                                    op: BinaryOp::Multiply,
+                                    left: Box::new(Expr::IntLiteral(3)),
+                                    right: Box::new(Expr::IntLiteral(4)),
+                                }),
+                            }),
+                            right: Box::new(Expr::IntLiteral(2)),
+                        }),
+                        right: Box::new(Expr::Binary {
+                            op: BinaryOp::Multiply,
+                            left: Box::new(Expr::Binary {
+                                op: BinaryOp::Modulo,
+                                left: Box::new(Expr::IntLiteral(5)),
+                                right: Box::new(Expr::IntLiteral(3)),
+                            }),
+                            right: Box::new(Expr::IntLiteral(2)),
+                        }),
+                    })),
+                ],
+            }),
+            external_lib: None,
+        }],
+        globals: vec![],
+    };
+
+    let result = compile_and_run(&program);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), 3); // (2 + 12) / 2 - (2 * 2) = 7 - 4 = 3
+}
 }
