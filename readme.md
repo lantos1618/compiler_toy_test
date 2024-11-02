@@ -22,3 +22,37 @@ Development cycle:
 • create parser
 • create lexer
 • create token
+
+
+
+
+# thoughts
+
+
+loop(0..10) |i, e, lh|  {
+    if i == 5 {
+        lh.continue;
+    }
+    loop(0..10) |j, e2, lh2| {
+            if j == 5 {
+                lh2.continue;
+            }
+        print(j);
+    }
+    print(i);
+}
+
+
+
+
+
+loop {
+    cond,
+    body: func(index: int, lh: LoopHandler)
+}
+loop(0..10, (i, lh) {
+    if i == 5 {
+        lh.continue;
+    }
+    print(i);
+})
