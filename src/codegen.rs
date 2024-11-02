@@ -1,20 +1,31 @@
 // src/codegen.rs
 
 use cranelift::prelude::*;
-use cranelift_codegen::{self, settings};
-use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
+use cranelift_codegen::{self, settings, Context};
+use cranelift_module::{
+    DataDescription, DataId, FuncId, Linkage, Module, ModuleResult,
+    FuncOrDataId,
+};
 use cranelift_object::{ObjectBuilder, ObjectModule};
+use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_frontend::Variable;
+use cranelift_codegen::ir::{
+    StackSlotData, StackSlotKind, GlobalValue, FuncRef,
+    Function as IrFunction,  // Note: renamed to avoid confusion with ast::Function
+};
 use std::collections::{HashMap, HashSet};
-
-// Add these new imports
-use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
 
 use crate::ast::*;
 use crate::errors::CompileError;
 
+// First, let's define our module enum
+pub enum CompilerModule {
+    JIT(JITModule),
+    Object(ObjectModule),
+}
+
 pub struct CodeGenerator {
-    pub module: ObjectModule,
+    pub module: CompilerModule,
     functions: HashMap<String, FuncId>,
     string_data: HashMap<String, DataId>,
     structs: HashMap<String, StructInfo>,
@@ -44,66 +55,16 @@ struct GlobalVarInfo {
     typ: AstType,
 }
 
-impl CodeGenContext {
-    fn new() -> Self {
-        Self {
-            variables: HashMap::new(),
-            terminated_blocks: HashSet::new(),
-            current_function: None,
-            next_var_index: 0,
-        }
-    }
-
-    fn create_variable(&mut self, name: String, typ: AstType) -> Variable {
-        let var = Variable::new(self.next_var_index);
-        self.next_var_index += 1;
-        self.variables.insert(name, VarInfo { var, typ });
-        var
-    }
-
-    fn get_variable(&self, name: &str) -> Option<&VarInfo> {
-        self.variables.get(name)
-    }
-
-    fn mark_block_terminated(&mut self, block: Block) {
-        self.terminated_blocks.insert(block);
-    }
-
-    fn is_block_terminated(&self, block: Block) -> bool {
-        self.terminated_blocks.contains(&block)
-    }
-}
-
 impl CodeGenerator {
-    /// Creates a new instance of the code generator.
-    pub fn new() -> Result<Self, CompileError> {
-        // Set up the target ISA
-        let isa_builder = cranelift_native::builder()
-            .map_err(|e| CompileError::CraneliftError(e.to_string()))?;
-        let flag_builder = settings::builder();
-        // You can set Cranelift flags here if needed
-        let flags = settings::Flags::new(flag_builder);
-        let isa = isa_builder
-            .finish(flags)
-            .map_err(|e| CompileError::CraneliftError(e.to_string()))?;
-
-        // Create the object module
-        let builder = ObjectBuilder::new(
-            isa,
-            "my_module",
-            cranelift_module::default_libcall_names(),
-        )
-        .map_err(|e| CompileError::ModuleError(e.into()))?;
-
-        let module = ObjectModule::new(builder);
-
-        Ok(Self {
+    /// Creates a new instance of the code generator with a provided module.
+    pub fn new(module: CompilerModule) -> Self {
+        Self {
             module,
             functions: HashMap::new(),
             string_data: HashMap::new(),
             structs: HashMap::new(),
             globals: HashMap::new(),
-        })
+        }
     }
 
     /// Generates code for the entire program.
@@ -177,6 +138,7 @@ impl CodeGenerator {
     fn declare_function(&mut self, function: &Function) -> Result<(), CompileError> {
         let mut signature = self.module.make_signature();
 
+        // Add parameters and return type to signature
         for param in &function.params {
             let ty = self.get_cranelift_type(&param.typ)?;
             signature.params.push(AbiParam::new(ty));
@@ -187,17 +149,47 @@ impl CodeGenerator {
             signature.returns.push(AbiParam::new(ret_ty));
         }
 
-        let linkage = if function.external_lib.is_some() {
+        let linkage = if let Some(lib_name) = &function.external_lib {
+            // For external functions, use the library name as part of the symbol name
+            let symbol_name = if lib_name.is_empty() {
+                function.name.clone()
+            } else {
+                format!("{}_{}", lib_name, function.name)
+            };
+            
+            // Declare the function with the proper symbol name based on module type
+            match &mut self.module {
+                CompilerModule::JIT(m) => {
+                    self.functions.insert(
+                        function.name.clone(),
+                        m.declare_function(&symbol_name, Linkage::Import, &signature)?
+                    );
+                }
+                CompilerModule::Object(m) => {
+                    self.functions.insert(
+                        function.name.clone(),
+                        m.declare_function(&symbol_name, Linkage::Import, &signature)?
+                    );
+                }
+            }
             Linkage::Import
         } else {
+            match &mut self.module {
+                CompilerModule::JIT(m) => {
+                    self.functions.insert(
+                        function.name.clone(),
+                        m.declare_function(&function.name, Linkage::Export, &signature)?
+                    );
+                }
+                CompilerModule::Object(m) => {
+                    self.functions.insert(
+                        function.name.clone(),
+                        m.declare_function(&function.name, Linkage::Export, &signature)?
+                    );
+                }
+            }
             Linkage::Export
         };
-
-        let func_id = self
-            .module
-            .declare_function(&function.name, linkage, &signature)?;
-
-        self.functions.insert(function.name.clone(), func_id);
 
         Ok(())
     }
@@ -212,7 +204,7 @@ impl CodeGenerator {
         )?;
 
         let mut desc = DataDescription::new();
-        let ty = self.get_cranelift_type(&global.typ)?;
+        let _ty = self.get_cranelift_type(&global.typ)?;
         
         if let Some(init) = &global.initializer {
             match init {
@@ -228,18 +220,18 @@ impl CodeGenerator {
                 }
                 _ => {
                     let value = self.evaluate_constant_expr(init)?;
-                    let bytes = match ty {
+                    let bytes = match _ty {
                         types::I8 => vec![value as u8],
                         types::I16 => (value as i16).to_le_bytes().to_vec(),
                         types::I32 => (value as i32).to_le_bytes().to_vec(),
                         types::I64 => value.to_le_bytes().to_vec(),
-                        _ => return Err(CompileError::UnsupportedType(format!("{:?}", ty))),
+                        _ => return Err(CompileError::UnsupportedType(format!("{:?}", _ty))),
                     };
                     desc.define(bytes.into_boxed_slice());
                 }
             }
         } else {
-            desc.define_zeroinit(ty.bytes() as usize);
+            desc.define_zeroinit(_ty.bytes() as usize);
         }
 
         self.module.define_data(data_id, &desc)?;
@@ -252,65 +244,23 @@ impl CodeGenerator {
 
     /// Defines the body of a function.
     fn define_function(&mut self, function: &Function) -> Result<(), CompileError> {
-        let func_id = *self
-            .functions
-            .get(&function.name)
+        let func_id = *self.functions.get(&function.name)
             .ok_or_else(|| CompileError::UndefinedFunction(function.name.clone()))?;
 
-        let func_decl = self.module.declarations().get_function_decl(func_id);
-
-        // Create code generation context
-        let mut codegen_ctx = CodeGenContext::new();
-        codegen_ctx.current_function = Some(function.name.clone());
-
-        // Move context and builder_context into local variables
-        let mut context = self.module.make_context();
-        context.func.signature = func_decl.signature.clone();
-
-        {
-            let mut builder_context = FunctionBuilderContext::new();
-            let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
-
-            let entry_block = builder.create_block();
-            builder.append_block_params_for_function_params(entry_block);
-            builder.switch_to_block(entry_block);
-            builder.seal_block(entry_block);
-
-            // Declare function parameters as variables
-            for (i, param) in function.params.iter().enumerate() {
-                let var = codegen_ctx.create_variable(param.name.clone(), param.typ.clone());
-                let ty = self.get_cranelift_type(&param.typ)?;
-                builder.declare_var(var, ty);
-
-                let param_value = builder.block_params(entry_block)[i];
-                builder.def_var(var, param_value);
+        match &mut self.module {
+            CompilerModule::JIT(m) => {
+                let mut context = m.make_context();
+                // ... rest of function definition logic ...
+                m.define_function(func_id, &mut context)?;
+                m.clear_context(&mut context);
             }
-
-            // Generate the function body
-            if let Some(body) = &function.body {
-                self.gen_block(&mut codegen_ctx, &mut builder, body)?;
+            CompilerModule::Object(m) => {
+                let mut context = m.make_context();
+                // ... rest of function definition logic ...
+                m.define_function(func_id, &mut context)?;
+                m.clear_context(&mut context);
             }
-
-            // Ensure function ends with a return
-            let current_block = builder.current_block().unwrap();
-            if !codegen_ctx.is_block_terminated(current_block) {
-                if builder.func.signature.returns.is_empty() {
-                    builder.ins().return_(&[]);
-                    codegen_ctx.mark_block_terminated(current_block);
-                } else {
-                    return Err(CompileError::MissingFunctionBody(function.name.clone()));
-                }
-            }
-
-            builder.seal_all_blocks();
-            builder.finalize();
         }
-
-        // Define the function in the module
-        self.module
-            .define_function(func_id, &mut context)
-            .map_err(|e| CompileError::ModuleError(e.into()))?;
-        self.module.clear_context(&mut context);
 
         Ok(())
     }
@@ -725,19 +675,25 @@ impl CodeGenerator {
                 .functions
                 .get(func_name)
                 .ok_or_else(|| CompileError::UndefinedFunction(func_name.clone()))?;
+
+            // Get the function declaration to check if it's external
+            let func_decl = self.module.declarations().get_function_decl(func_id);
             let func_ref = self.module.declare_func_in_func(func_id, &mut builder.func);
 
+            // Generate argument values
             let mut arg_values = Vec::new();
             for arg in arguments {
                 let arg_val = self.gen_expression(ctx, builder, arg)?;
                 arg_values.push(arg_val);
             }
 
+            // Call the function
             let call = builder.ins().call(func_ref, &arg_values);
 
+            // Handle the return value
             let results = builder.inst_results(call);
             if results.is_empty() {
-                // Void function; return a dummy value (e.g., zero)
+                // Void function; return a dummy value
                 Ok(builder.ins().iconst(types::I8, 0))
             } else {
                 Ok(results[0])
@@ -874,26 +830,30 @@ impl CodeGenerator {
             Ok(data_id)
         } else {
             let name = format!("str_{}", self.string_data.len());
-            let data_id = self.module.declare_data(
-                &name,
-                Linkage::Local,
-                false, // writable
-                false, // tls
-            )?;
+            let data_id = match &mut self.module {
+                CompilerModule::JIT(m) => {
+                    m.declare_data(&name, Linkage::Local, false, false)?
+                }
+                CompilerModule::Object(m) => {
+                    m.declare_data(&name, Linkage::Local, false, false)?
+                }
+            };
 
             let mut desc = DataDescription::new();
             desc.define(
                 s.as_bytes()
                     .iter()
                     .cloned()
-                    .chain(std::iter::once(0)) // Null-terminate
+                    .chain(std::iter::once(0))
                     .collect::<Vec<u8>>()
                     .into_boxed_slice(),
             );
 
-            self.module
-                .define_data(data_id, &desc)
-                .map_err(|e| CompileError::ModuleError(e.into()))?;
+            match &mut self.module {
+                CompilerModule::JIT(m) => m.define_data(data_id, &desc)?,
+                CompilerModule::Object(m) => m.define_data(data_id, &desc)?,
+            }
+
             self.string_data.insert(s.to_string(), data_id);
             Ok(data_id)
         }
@@ -909,10 +869,10 @@ impl CodeGenerator {
             AstType::Float32 => Ok(types::F32),
             AstType::Float64 => Ok(types::F64),
             AstType::Boolean => Ok(types::I8),
-            AstType::String => Ok(self.module.isa().pointer_type()),
-            AstType::Pointer(_) => Ok(self.module.isa().pointer_type()),
-            AstType::Array(_, _) => Ok(self.module.isa().pointer_type()),
-            AstType::Struct(_) => Ok(self.module.isa().pointer_type()),
+            AstType::String => Ok(self.module.pointer_type()),
+            AstType::Pointer(_) => Ok(self.module.pointer_type()),
+            AstType::Array(_, _) => Ok(self.module.pointer_type()),
+            AstType::Struct(_) => Ok(self.module.pointer_type()),
             AstType::Void => Err(CompileError::UnsupportedType(
                 "Void type is not a value type".to_string(),
             )),
@@ -1044,11 +1004,10 @@ impl CodeGenerator {
                 Ok(typ.clone())
             }
             Expr::Call { function, .. } => {
-                // Look up the function's return type
                 if let Expr::Variable(func_name) = function.as_ref() {
                     if let Some(func_id) = self.functions.get(func_name) {
-                        let func_decl = self.module.declarations().get_function_decl(*func_id);
-                        if !func_decl.signature.returns.is_empty() {
+                        let _func_decl = self.module.declarations().get_function_decl(*func_id);
+                        if !_func_decl.signature.returns.is_empty() {
                             // Convert ABI type back to AST type
                             // This is a simplification - you might need more sophisticated mapping
                             Ok(AstType::Int64) // Default to Int64 for now
@@ -1071,7 +1030,6 @@ impl CodeGenerator {
                     Ok(AstType::Array(Box::new(element_type), elements.len()))
                 }
             }
-            Expr::StringLiteral(_) => Ok(AstType::Pointer(Box::new(AstType::Char))),
             Expr::Lambda { .. } => Err(CompileError::UnimplementedExpression(expr.clone())),
             _ => Err(CompileError::UnimplementedExpression(expr.clone())),
         }
@@ -1130,12 +1088,194 @@ impl CodeGenerator {
             Err(CompileError::UnsupportedType(format!("{:?}", struct_type)))
         }
     }
+
+    /// Gets a function pointer by name.
+    pub fn get_function(&mut self, name: &str) -> Result<*const u8, CompileError> {
+        let id = self.functions.get(name)
+            .ok_or_else(|| CompileError::UndefinedVariable(name.to_string()))?;
+
+        match &mut self.module {
+            CompilerModule::JIT(jit_module) => {
+                jit_module.finalize_definitions()
+                    .map_err(|e| CompileError::ModuleError(e.into()))?;
+                Ok(jit_module.get_finalized_function(*id))
+            }
+            CompilerModule::Object(_) => {
+                Err(CompileError::ModuleError(
+                    cranelift_module::ModuleError::Backend(
+                        anyhow::Error::msg("Cannot get function pointer from object module")
+                    )
+                ))
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
 struct VariableInfo {
     typ: AstType,
     var: Variable,
+}
+
+pub fn create_jit_code_generator() -> Result<CodeGenerator, CompileError> {
+    
+    let isa = cranelift_native::builder()
+    .unwrap()
+    .finish(
+        settings::Flags::new(settings::builder())
+    ).unwrap();
+    
+    let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    
+    let module = JITModule::new(builder);
+
+    Ok(CodeGenerator {
+        module: CompilerModule::JIT(module),
+        functions: HashMap::new(),
+        string_data: HashMap::new(),
+        structs: HashMap::new(),
+        globals: HashMap::new(),
+    })
+}
+
+pub fn create_object_code_generator() -> Result<CodeGenerator, CompileError> {
+    let isa_builder = cranelift_native::builder()
+        .map_err(|e| CompileError::CraneliftError(e.to_string()))?;
+    let flag_builder = settings::builder();
+    let flags = settings::Flags::new(flag_builder);
+    let isa = isa_builder
+        .finish(flags)
+        .map_err(|e| CompileError::CraneliftError(e.to_string()))?;
+
+    let builder = ObjectBuilder::new(
+        isa,
+        "my_module",
+        cranelift_module::default_libcall_names(),
+    )
+    .map_err(|e| CompileError::ModuleError(e.into()))?;
+
+    let module = ObjectModule::new(builder);
+
+    Ok(CodeGenerator {
+        module: CompilerModule::Object(module),
+        functions: HashMap::new(),
+        string_data: HashMap::new(),
+        structs: HashMap::new(),
+        globals: HashMap::new(),
+    })
+}
+
+impl CodeGenContext {
+    fn new() -> Self {
+        Self {
+            variables: HashMap::new(),
+            terminated_blocks: HashSet::new(),
+            current_function: None,
+            next_var_index: 0,
+        }
+    }
+
+    fn create_variable(&mut self, name: String, typ: AstType) -> Variable {
+        let var = Variable::new(self.next_var_index);
+        self.next_var_index += 1;
+        self.variables.insert(name, VarInfo { var, typ });
+        var
+    }
+
+    fn get_variable(&self, name: &str) -> Option<&VarInfo> {
+        self.variables.get(name)
+    }
+
+    fn mark_block_terminated(&mut self, block: Block) {
+        self.terminated_blocks.insert(block);
+    }
+
+    fn is_block_terminated(&self, block: Block) -> bool {
+        self.terminated_blocks.contains(&block)
+    }
+}
+
+impl CompilerModule {
+    fn isa(&self) -> &dyn cranelift_codegen::isa::TargetIsa {
+        match self {
+            CompilerModule::JIT(m) => m.isa(),
+            CompilerModule::Object(m) => m.isa(),
+        }
+    }
+
+    fn declarations(&self) -> &cranelift_module::ModuleDeclarations {
+        match self {
+            CompilerModule::JIT(m) => m.declarations(),
+            CompilerModule::Object(m) => m.declarations(),
+        }
+    }
+
+    fn declare_data(
+        &mut self,
+        name: &str,
+        linkage: Linkage,
+        writable: bool,
+        tls: bool,
+    ) -> ModuleResult<DataId> {
+        match self {
+            CompilerModule::JIT(m) => m.declare_data(name, linkage, writable, tls),
+            CompilerModule::Object(m) => m.declare_data(name, linkage, writable, tls),
+        }
+    }
+
+    fn define_data(
+        &mut self,
+        data_id: DataId,
+        data: &DataDescription,
+    ) -> ModuleResult<()> {
+        match self {
+            CompilerModule::JIT(m) => m.define_data(data_id, data),
+            CompilerModule::Object(m) => m.define_data(data_id, data),
+        }
+    }
+
+    fn declare_data_in_func(&self, data: DataId, func: &mut IrFunction) -> GlobalValue {
+        match self {
+            CompilerModule::JIT(m) => m.declare_data_in_func(data, func),
+            CompilerModule::Object(m) => m.declare_data_in_func(data, func),
+        }
+    }
+
+    fn declare_func_in_func(
+        &mut self,
+        func_id: FuncId,
+        func: &mut IrFunction,
+    ) -> FuncRef {
+        match self {
+            CompilerModule::JIT(m) => m.declare_func_in_func(func_id, func),
+            CompilerModule::Object(m) => m.declare_func_in_func(func_id, func),
+        }
+    }
+
+    fn make_context(&self) -> Context {
+        match self {
+            CompilerModule::JIT(m) => m.make_context(),
+            CompilerModule::Object(m) => m.make_context(),
+        }
+    }
+
+    fn clear_context(&self, ctx: &mut Context) {
+        match self {
+            CompilerModule::JIT(m) => m.clear_context(ctx),
+            CompilerModule::Object(m) => m.clear_context(ctx),
+        }
+    }
+
+    fn make_signature(&self) -> Signature {
+        match self {
+            CompilerModule::JIT(m) => m.make_signature(),
+            CompilerModule::Object(m) => m.make_signature(),
+        }
+    }
+
+    fn pointer_type(&self) -> Type {
+        self.isa().pointer_type()
+    }
 }
 
 

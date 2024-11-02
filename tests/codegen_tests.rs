@@ -2,36 +2,41 @@
 
 #[cfg(test)]
 mod codegen_tests {
-    use super::*; // Import items from the main crate
-
-
     use compiler::ast::*;
     use compiler::codegen::*;
     use compiler::errors::*;
     use cranelift::prelude::*;
-    use cranelift_module::Module;
-    use std::collections::HashMap;
+    use cranelift_jit::{JITBuilder, JITModule};
 
     fn compile_and_run(program: &Program) -> Result<i64, CompileError> {
-        // Initialize the code generator
-        let mut codegen = CodeGenerator::new()?;
+        // Set up the target ISA
+        let mut flag_builder = settings::builder();
+        flag_builder.set("use_colocated_libcalls", "false").unwrap();
+        flag_builder.set("is_pic", "false").unwrap();
+        let isa_builder = cranelift_native::builder()
+            .map_err(|e| CompileError::CraneliftError(e.to_string()))?;
+        let isa = isa_builder
+            .finish(settings::Flags::new(flag_builder))
+            .map_err(|e| CompileError::CraneliftError(e.to_string()))?;
+
+        // Create JIT instance
+        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let module = JITModule::new(builder);
+
+        let mut codegen = create_jit_code_generator()?;
 
         // Generate code for the program
         codegen.gen_program(program)?;
 
-        // Finalize the module and get the compiled bytes
-        let object = codegen.module.finish();
-
-        // Write the object to a file (optional, for debugging)
-        // std::fs::write("output.o", object.emit().unwrap()).unwrap();
-
-        // Since we can't execute the compiled object directly in tests,
-        // we'll assume that if code generation succeeds, the test passes.
-        // In a real-world scenario, you might use JIT or write the object to disk and execute it.
-
-        Ok(0)
+        // Look up the main function
+        let main_fn = codegen.get_function("main")?;
+        
+        // Get the function pointer and cast it to the right type
+        let main: extern "C" fn() -> i64 = unsafe { std::mem::transmute(main_fn) };
+        
+        // Call the function
+        Ok(main())
     }
-
 
     #[test]
     fn test_basic_arithmetic() {

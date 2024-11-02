@@ -25,8 +25,19 @@ Development cycle:
 
 
 
+# program flow
+
+1. lex
+2. parse
+2.1 macros
+2.2 preprocess 
+3. typecheck
+4. codegen
+
 
 # thoughts
+
+
 
 
 loop(0..10) |i, e, lh|  {
