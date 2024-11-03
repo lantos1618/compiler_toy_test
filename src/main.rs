@@ -1,10 +1,20 @@
 use compiler::{ast::*, codegen::create_jit_code_generator};
-use cranelift_codegen::gimli::Expression;
+
 
 
 
 fn main() {
 
+    // puts(str: ptr<i8>) -> i32
+    // main() -> i32 {
+    //     i = 0            
+    //     while (i < 10) {
+    //         puts("Hello, World!\n")
+    //         i++
+    //     }
+    //     return 0
+    // }
+    
     let print_func = Function {
         name: "puts".to_string(),
         params: vec![

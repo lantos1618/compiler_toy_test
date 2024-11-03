@@ -43,4 +43,10 @@ pub enum CompileError {
 
     #[error("Module error: {0}")]
     ModuleError(#[from] ModuleError),
+
+    #[error("Invalid break statement")]
+    InvalidBreak,
+
+    #[error("Invalid continue statement")]
+    InvalidContinue,
 }

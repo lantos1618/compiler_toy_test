@@ -4,7 +4,6 @@ use cranelift::prelude::*;
 use cranelift_codegen::{self, settings, Context};
 use cranelift_module::{
     DataDescription, DataId, FuncId, Linkage, Module, ModuleResult,
-    FuncOrDataId,
 };
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -39,10 +38,11 @@ struct StructInfo {
 }
 
 struct CodeGenContext {
-    variables: HashMap<String, VarInfo>,
-    terminated_blocks: HashSet<Block>,
+    terminated_blocks: HashSet<cranelift::prelude::Block>,
     current_function: Option<String>,
     next_var_index: usize,
+    scopes: Vec<HashMap<String, VarInfo>>,
+    loop_stack: Vec<LoopContext>,
 }
 
 struct VarInfo {
@@ -53,6 +53,11 @@ struct VarInfo {
 struct GlobalVarInfo {
     data_id: DataId,
     typ: AstType,
+}
+
+struct LoopContext {
+    header_block: cranelift::prelude::Block,
+    exit_block: cranelift::prelude::Block,
 }
 
 impl CodeGenerator {
@@ -149,7 +154,7 @@ impl CodeGenerator {
             signature.returns.push(AbiParam::new(ret_ty));
         }
 
-        let linkage = if let Some(lib_name) = &function.external_lib {
+        let _linkage = if let Some(lib_name) = &function.external_lib {
             // For external functions, use the library name as part of the symbol name
             let symbol_name = if lib_name.is_empty() {
                 function.name.clone()
@@ -268,12 +273,16 @@ impl CodeGenerator {
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
+        self.ensure_block_has_instruction(&mut builder);
+
+        // Ensure entry block has an instruction before declaring variables
+        builder.ins().iconst(types::I64, 0);
 
         // Declare function parameters as variables
         for (i, param) in function.params.iter().enumerate() {
             let var = codegen_ctx.create_variable(param.name.clone(), param.typ.clone());
-            let ty = self.get_cranelift_type(&param.typ)?;
-            builder.declare_var(var, ty);
+            let _ty = self.get_cranelift_type(&param.typ)?;
+            builder.declare_var(var, _ty);
 
             let param_value = builder.block_params(entry_block)[i];
             builder.def_var(var, param_value);
@@ -288,6 +297,7 @@ impl CodeGenerator {
         let current_block = builder.current_block().unwrap();
         if !codegen_ctx.is_block_terminated(current_block) {
             if builder.func.signature.returns.is_empty() {
+                self.ensure_block_has_instruction(&mut builder);
                 builder.ins().return_(&[]);
                 codegen_ctx.mark_block_terminated(current_block);
             } else {
@@ -295,8 +305,8 @@ impl CodeGenerator {
             }
         }
 
-        // Seal all blocks and finalize
-        builder.seal_block(entry_block); // Seal entry block explicitly
+        // Seal entry block and finalize
+        builder.seal_block(entry_block);
         builder.seal_all_blocks();
         builder.finalize();
 
@@ -389,12 +399,22 @@ impl CodeGenerator {
                 self.gen_block(ctx, builder, block)?;
             }
             Stmt::Break => {
-                // Implement break statement
-                return Err(CompileError::UnimplementedStatement(stmt.clone()));
+                if let Some(loop_ctx) = ctx.current_loop() {
+                    self.ensure_block_has_instruction(builder);
+                    builder.ins().jump(loop_ctx.exit_block, &[]);
+                    ctx.mark_block_terminated(builder.current_block().unwrap());
+                } else {
+                    return Err(CompileError::InvalidBreak);
+                }
             }
             Stmt::Continue => {
-                // Implement continue statement
-                return Err(CompileError::UnimplementedStatement(stmt.clone()));
+                if let Some(loop_ctx) = ctx.current_loop() {
+                    self.ensure_block_has_instruction(builder);
+                    builder.ins().jump(loop_ctx.header_block, &[]);
+                    ctx.mark_block_terminated(builder.current_block().unwrap());
+                } else {
+                    return Err(CompileError::InvalidContinue);
+                }
             }
             // Implement other statements like For
             _ => return Err(CompileError::UnimplementedStatement(stmt.clone())),
@@ -465,37 +485,36 @@ impl CodeGenerator {
         then_branch: &Box<Stmt>,
         else_branch: &Option<Box<Stmt>>,
     ) -> Result<(), CompileError> {
+        self.ensure_block_has_instruction(builder);
         let cond_value = self.gen_expression(ctx, builder, condition)?;
+        
         let then_block = builder.create_block();
         let else_block = builder.create_block();
         let merge_block = builder.create_block();
 
         builder.ins().brif(cond_value, then_block, &[], else_block, &[]);
-        let current_block = builder.current_block().unwrap();
-        ctx.mark_block_terminated(current_block);
+        ctx.mark_block_terminated(builder.current_block().unwrap());
 
         // Then block
-        builder.switch_to_block(then_block);
+        self.switch_to_block(ctx, builder, then_block);
+        ctx.push_scope();
         self.gen_statement(ctx, builder, then_branch)?;
-        if !ctx.is_block_terminated(then_block) {
-            builder.ins().jump(merge_block, &[]);
-            ctx.mark_block_terminated(then_block);
-        }
+        ctx.pop_scope();
+        self.terminate_block(ctx, builder, then_block, merge_block);
         builder.seal_block(then_block);
 
         // Else block
-        builder.switch_to_block(else_block);
+        self.switch_to_block(ctx, builder, else_block);
         if let Some(else_stmt) = else_branch {
+            ctx.push_scope();
             self.gen_statement(ctx, builder, else_stmt)?;
+            ctx.pop_scope();
         }
-        if !ctx.is_block_terminated(else_block) {
-            builder.ins().jump(merge_block, &[]);
-            ctx.mark_block_terminated(else_block);
-        }
+        self.terminate_block(ctx, builder, else_block, merge_block);
         builder.seal_block(else_block);
 
         // Merge block
-        builder.switch_to_block(merge_block);
+        self.switch_to_block(ctx, builder, merge_block);
         builder.seal_block(merge_block);
 
         Ok(())
@@ -509,46 +528,48 @@ impl CodeGenerator {
         condition: &Expr,
         body: &Box<Stmt>,
     ) -> Result<(), CompileError> {
-        // 1. Create blocks for the loop structure
-        let header_block = builder.create_block();  // Condition evaluation
-        let body_block = builder.create_block();    // Loop body
-        let follow_block = builder.create_block();  // Code after the loop
+        // Create blocks for the loop
+        let header_block = builder.create_block();
+        let body_block = builder.create_block();
+        let follow_block = builder.create_block();
 
-        // 2. Branch from current block to loop header
+        // Push loop context for break/continue
+        ctx.push_loop(header_block, follow_block);
+
+        // Jump from current block to header block
+        builder.ins().nop(); // Ensure current block has an instruction
         builder.ins().jump(header_block, &[]);
-        let entry_block = builder.current_block().unwrap();
-        ctx.mark_block_terminated(entry_block);
+        ctx.mark_block_terminated(builder.current_block().unwrap());
 
-        // 3. Generate loop header (condition check)
+        // Generate header block (condition evaluation)
         builder.switch_to_block(header_block);
-        let cond_value = self.gen_expression(ctx, builder, condition)?;
-        builder.ins().brif(cond_value, body_block, &[], follow_block, &[]);
+        builder.ins().nop(); // Ensure header block has an instruction
+        let cond_val = self.gen_expression(ctx, builder, condition)?;
+        builder.ins().brif(cond_val, body_block, &[], follow_block, &[]);
         ctx.mark_block_terminated(header_block);
 
-        // 4. Generate loop body
+        // Generate body block
         builder.switch_to_block(body_block);
+        builder.ins().nop(); // Ensure body block has an instruction
         self.gen_statement(ctx, builder, body)?;
         
-        // If body block isn't already terminated (e.g., by a return),
-        // jump back to header for next iteration
-        if !ctx.is_block_terminated(body_block) {
+        // If body block isn't already terminated (by break/continue), jump back to header
+        if !ctx.is_block_terminated(builder.current_block().unwrap()) {
             builder.ins().jump(header_block, &[]);
-            ctx.mark_block_terminated(body_block);
+            ctx.mark_block_terminated(builder.current_block().unwrap());
         }
 
-        // 5. Move to the follow block for code after the loop
-        builder.switch_to_block(follow_block);
-        // Add a placeholder instruction to satisfy Cranelift
-        let zero = builder.ins().iconst(types::I64, 0);
-        builder.ins().iconst(types::I64, 0);
+        // Seal blocks in correct order
+        builder.seal_block(body_block);
+        builder.seal_block(header_block);
 
-        // 6. Seal blocks in correct order:
-        // - Body can see the header
-        // - Header can see the entry and body blocks
-        // - Follow block can see the header
-        builder.seal_block(body_block);    // Seal body first
-        builder.seal_block(header_block);  // Then header
-        builder.seal_block(follow_block);  // Finally follow block
+        // Pop loop context
+        ctx.pop_loop();
+
+        // Switch to follow block
+        builder.switch_to_block(follow_block);
+        builder.ins().nop(); // Ensure follow block has an instruction
+        builder.seal_block(follow_block);
 
         Ok(())
     }
@@ -1174,6 +1195,33 @@ impl CodeGenerator {
             }
         }
     }
+
+    // Helper methods for block handling
+    fn ensure_block_has_instruction(&self, builder: &mut FunctionBuilder) {
+        builder.ins().nop();
+    }
+
+    fn switch_to_block(&mut self, ctx: &mut CodeGenContext, builder: &mut FunctionBuilder, 
+                      block: cranelift::prelude::Block) {
+        // Ensure current block is properly terminated
+        let current = builder.current_block().unwrap();
+        if !ctx.is_block_terminated(current) {
+            builder.ins().nop();
+        }
+        
+        // Switch to new block
+        builder.switch_to_block(block);
+        self.ensure_block_has_instruction(builder);
+    }
+
+    fn terminate_block(&mut self, ctx: &mut CodeGenContext, builder: &mut FunctionBuilder, 
+                      from_block: cranelift::prelude::Block, to_block: cranelift::prelude::Block) {
+        if !ctx.is_block_terminated(from_block) {
+            self.ensure_block_has_instruction(builder);
+            builder.ins().jump(to_block, &[]);
+            ctx.mark_block_terminated(from_block);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1233,30 +1281,63 @@ pub fn create_object_code_generator() -> Result<CodeGenerator, CompileError> {
 impl CodeGenContext {
     fn new() -> Self {
         Self {
-            variables: HashMap::new(),
             terminated_blocks: HashSet::new(),
             current_function: None,
             next_var_index: 0,
+            scopes: vec![HashMap::new()],
+            loop_stack: Vec::new(),
         }
     }
 
     fn create_variable(&mut self, name: String, typ: AstType) -> Variable {
         let var = Variable::new(self.next_var_index);
         self.next_var_index += 1;
-        self.variables.insert(name, VarInfo { var, typ });
+        let var_info = VarInfo { var, typ };
+        
+        if let Some(current_scope) = self.scopes.last_mut() {
+            current_scope.insert(name, var_info);
+        }
         var
     }
 
     fn get_variable(&self, name: &str) -> Option<&VarInfo> {
-        self.variables.get(name)
+        for scope in self.scopes.iter().rev() {
+            if let Some(var_info) = scope.get(name) {
+                return Some(var_info);
+            }
+        }
+        None
     }
 
-    fn mark_block_terminated(&mut self, block: Block) {
+    fn mark_block_terminated(&mut self, block: cranelift::prelude::Block) {
         self.terminated_blocks.insert(block);
     }
 
-    fn is_block_terminated(&self, block: Block) -> bool {
+    fn is_block_terminated(&self, block: cranelift::prelude::Block) -> bool {
         self.terminated_blocks.contains(&block)
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn push_loop(&mut self, header: cranelift::prelude::Block, exit: cranelift::prelude::Block) {
+        self.loop_stack.push(LoopContext {
+            header_block: header,
+            exit_block: exit,
+        });
+    }
+
+    fn pop_loop(&mut self) -> Option<LoopContext> {
+        self.loop_stack.pop()
+    }
+
+    fn current_loop(&self) -> Option<&LoopContext> {
+        self.loop_stack.last()
     }
 }
 

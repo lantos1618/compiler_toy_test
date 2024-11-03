@@ -391,7 +391,7 @@ fn test_type_casting() {
 
 #[test]
 fn test_string_literals() {
-    // int main() { char* s = "Hello, World!"; return 0; }
+    // int main() { char* s = "\nHello, World!\n"; return 0; }
     let program = Program {
         structs: vec![],
         functions: vec![Function {
@@ -403,7 +403,7 @@ fn test_string_literals() {
                     Stmt::VarDecl(VarDecl {
                         name: "s".to_string(),
                         typ: AstType::Pointer(Box::new(AstType::Char)),
-                        initializer: Some(Expr::StringLiteral("Hello, World!".to_string())),
+                        initializer: Some(Expr::StringLiteral("\nHello, World!\n".to_string())),
                         is_mutable: false,
                     }),
                     Stmt::Return(Some(Expr::IntLiteral(0))),
@@ -576,14 +576,15 @@ fn test_while_loop() {
 fn test_nested_while_loops() {
     // Tests nested while loops
     // int main() {
-    //     int i = 0, j = 0, sum = 0;
+    //     int sum = 0;
+    //     int i = 0;
+    //     int j = 0;
     //     while (i < 3) {
-    //         j = 0;
     //         while (j < 2) {
-    //             sum = sum + (i * j);
-    //             j = j + 1;
+    //             sum += i * j;
+    //             j++;
     //         }
-    //         i = i + 1;
+    //         i++;
     //     }
     //     return sum;
     // }
@@ -595,26 +596,28 @@ fn test_nested_while_loops() {
             return_type: AstType::Int64,
             body: Some(AstBlock {
                 statements: vec![
-                    // Initialize variables
-                    Stmt::VarDecl(VarDecl {
-                        name: "i".to_string(),
-                        typ: AstType::Int64,
-                        initializer: Some(Expr::IntLiteral(0)),
-                        is_mutable: true,
-                    }),
-                    Stmt::VarDecl(VarDecl {
-                        name: "j".to_string(),
-                        typ: AstType::Int64,
-                        initializer: Some(Expr::IntLiteral(0)),
-                        is_mutable: true,
-                    }),
+                    // Initialize sum = 0
                     Stmt::VarDecl(VarDecl {
                         name: "sum".to_string(),
                         typ: AstType::Int64,
                         initializer: Some(Expr::IntLiteral(0)),
                         is_mutable: true,
                     }),
-                    // Outer while loop
+                    // Initialize i = 0
+                    Stmt::VarDecl(VarDecl {
+                        name: "i".to_string(),
+                        typ: AstType::Int64,
+                        initializer: Some(Expr::IntLiteral(0)),
+                        is_mutable: true,
+                    }),
+                    // Initialize j = 0
+                    Stmt::VarDecl(VarDecl {
+                        name: "j".to_string(),
+                        typ: AstType::Int64,
+                        initializer: Some(Expr::IntLiteral(0)),
+                        is_mutable: true,
+                    }),
+                    // Outer while loop: while (i < 3)
                     Stmt::While {
                         condition: Expr::Binary {
                             op: BinaryOp::LessThan,
@@ -623,12 +626,7 @@ fn test_nested_while_loops() {
                         },
                         body: Box::new(Stmt::Block(AstBlock {
                             statements: vec![
-                                // Reset j
-                                Stmt::Assignment {
-                                    target: Expr::Variable("j".to_string()),
-                                    value: Expr::IntLiteral(0),
-                                },
-                                // Inner while loop
+                                // Inner while loop: while (j < 2)
                                 Stmt::While {
                                     condition: Expr::Binary {
                                         op: BinaryOp::LessThan,
@@ -674,7 +672,7 @@ fn test_nested_while_loops() {
                             ],
                         })),
                     },
-                    // Return sum
+                    // return sum
                     Stmt::Return(Some(Expr::Variable("sum".to_string()))),
                 ],
             }),
@@ -685,7 +683,7 @@ fn test_nested_while_loops() {
 
     let result = compile_and_run(&program);
     assert!(result.is_ok());
-    assert_eq!(result.unwrap(), 3); // Corrected expected result
+    assert_eq!(result.unwrap(), 3); // Sum should be 3 (0*0 + 0*1 + 1*0 + 1*1 + 2*0 + 2*1)
 }
 
 #[test]
