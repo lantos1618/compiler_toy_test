@@ -12,7 +12,8 @@ use cranelift_codegen::ir::{
     StackSlotData, StackSlotKind, GlobalValue, FuncRef,
     Function as IrFunction,  // Note: renamed to avoid confusion with ast::Function
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, BTreeMap};
+use std::fmt::Write;
 
 use crate::ast::*;
 use crate::errors::CompileError;
@@ -29,6 +30,7 @@ pub struct CodeGenerator {
     string_data: HashMap<String, DataId>,
     structs: HashMap<String, StructInfo>,
     globals: HashMap<String, GlobalVarInfo>,
+    pub last_ir: Option<String>,
 }
 
 struct StructInfo {
@@ -38,11 +40,12 @@ struct StructInfo {
 }
 
 struct CodeGenContext {
-    terminated_blocks: HashSet<cranelift::prelude::Block>,
+    terminated_blocks: HashSet<Block>,
     current_function: Option<String>,
     next_var_index: usize,
-    scopes: Vec<HashMap<String, VarInfo>>,
+    scopes: Vec<ScopeInfo>,
     loop_stack: Vec<LoopContext>,
+    current_block: Option<Block>,
 }
 
 struct VarInfo {
@@ -56,8 +59,21 @@ struct GlobalVarInfo {
 }
 
 struct LoopContext {
-    header_block: cranelift::prelude::Block,
-    exit_block: cranelift::prelude::Block,
+    header_block: Block,
+    exit_block: Block,
+}
+
+struct BlockInfo {
+    block: Block,
+    sealed: bool,
+    has_terminator: bool,
+    phi_nodes: BTreeMap<usize, Value>,
+    instruction_count: usize,
+}
+
+struct ScopeInfo {
+    variables: HashMap<String, VarInfo>,
+    block_info: HashMap<Block, BlockInfo>,
 }
 
 impl CodeGenerator {
@@ -69,6 +85,7 @@ impl CodeGenerator {
             string_data: HashMap::new(),
             structs: HashMap::new(),
             globals: HashMap::new(),
+            last_ir: None,
         }
     }
 
@@ -273,7 +290,7 @@ impl CodeGenerator {
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
-        self.ensure_block_has_instruction(&mut builder);
+        self.ensure_block_has_instruction(&codegen_ctx, &mut builder);
 
         // Ensure entry block has an instruction before declaring variables
         builder.ins().iconst(types::I64, 0);
@@ -297,7 +314,7 @@ impl CodeGenerator {
         let current_block = builder.current_block().unwrap();
         if !codegen_ctx.is_block_terminated(current_block) {
             if builder.func.signature.returns.is_empty() {
-                self.ensure_block_has_instruction(&mut builder);
+                self.ensure_block_has_instruction(&codegen_ctx, &mut builder);
                 builder.ins().return_(&[]);
                 codegen_ctx.mark_block_terminated(current_block);
             } else {
@@ -310,16 +327,23 @@ impl CodeGenerator {
         builder.seal_all_blocks();
         builder.finalize();
 
+        // Before finalizing, capture the IR
+        self.capture_ir(&context);
+
         // Define the function in the module
         match &mut self.module {
             CompilerModule::JIT(m) => {
-                m.define_function(func_id, &mut context)
-                    .map_err(|e| CompileError::ModuleError(e.into()))?;
+                if let Err(e) = m.define_function(func_id, &mut context) {
+                    // Keep the IR for error reporting
+                    return Err(CompileError::ModuleError(e.into()));
+                }
                 m.clear_context(&mut context);
             }
             CompilerModule::Object(m) => {
-                m.define_function(func_id, &mut context)
-                    .map_err(|e| CompileError::ModuleError(e.into()))?;
+                if let Err(e) = m.define_function(func_id, &mut context) {
+                    // Keep the IR for error reporting
+                    return Err(CompileError::ModuleError(e.into()));
+                }
                 m.clear_context(&mut context);
             }
         }
@@ -398,24 +422,8 @@ impl CodeGenerator {
             Stmt::Block(block) => {
                 self.gen_block(ctx, builder, block)?;
             }
-            Stmt::Break => {
-                if let Some(loop_ctx) = ctx.current_loop() {
-                    self.ensure_block_has_instruction(builder);
-                    builder.ins().jump(loop_ctx.exit_block, &[]);
-                    ctx.mark_block_terminated(builder.current_block().unwrap());
-                } else {
-                    return Err(CompileError::InvalidBreak);
-                }
-            }
-            Stmt::Continue => {
-                if let Some(loop_ctx) = ctx.current_loop() {
-                    self.ensure_block_has_instruction(builder);
-                    builder.ins().jump(loop_ctx.header_block, &[]);
-                    ctx.mark_block_terminated(builder.current_block().unwrap());
-                } else {
-                    return Err(CompileError::InvalidContinue);
-                }
-            }
+            Stmt::Break => self.handle_break(ctx, builder),
+            Stmt::Continue => self.handle_continue(ctx, builder),
             // Implement other statements like For
             _ => return Err(CompileError::UnimplementedStatement(stmt.clone())),
         }
@@ -485,7 +493,7 @@ impl CodeGenerator {
         then_branch: &Box<Stmt>,
         else_branch: &Option<Box<Stmt>>,
     ) -> Result<(), CompileError> {
-        self.ensure_block_has_instruction(builder);
+        self.ensure_block_has_instruction(ctx, builder);
         let cond_value = self.gen_expression(ctx, builder, condition)?;
         
         let then_block = builder.create_block();
@@ -528,48 +536,48 @@ impl CodeGenerator {
         condition: &Expr,
         body: &Box<Stmt>,
     ) -> Result<(), CompileError> {
-        // Create blocks for the loop
+        // Create blocks
         let header_block = builder.create_block();
         let body_block = builder.create_block();
         let follow_block = builder.create_block();
+
+        // Register all blocks
+        ctx.register_block(header_block);
+        ctx.register_block(body_block);
+        ctx.register_block(follow_block);
 
         // Push loop context for break/continue
         ctx.push_loop(header_block, follow_block);
 
         // Jump from current block to header block
-        builder.ins().nop(); // Ensure current block has an instruction
-        builder.ins().jump(header_block, &[]);
-        ctx.mark_block_terminated(builder.current_block().unwrap());
+        self.terminate_block(ctx, builder, ctx.current_block.unwrap(), header_block);
 
         // Generate header block (condition evaluation)
-        builder.switch_to_block(header_block);
-        builder.ins().nop(); // Ensure header block has an instruction
+        self.switch_to_block(ctx, builder, header_block);
         let cond_val = self.gen_expression(ctx, builder, condition)?;
         builder.ins().brif(cond_val, body_block, &[], follow_block, &[]);
         ctx.mark_block_terminated(header_block);
 
         // Generate body block
-        builder.switch_to_block(body_block);
-        builder.ins().nop(); // Ensure body block has an instruction
+        self.switch_to_block(ctx, builder, body_block);
+        ctx.push_scope();
         self.gen_statement(ctx, builder, body)?;
+        ctx.pop_scope();
         
-        // If body block isn't already terminated (by break/continue), jump back to header
-        if !ctx.is_block_terminated(builder.current_block().unwrap()) {
-            builder.ins().jump(header_block, &[]);
-            ctx.mark_block_terminated(builder.current_block().unwrap());
+        // If body block isn't already terminated, jump back to header
+        if !ctx.is_block_terminated(body_block) {
+            self.terminate_block(ctx, builder, body_block, header_block);
         }
 
         // Seal blocks in correct order
-        builder.seal_block(body_block);
-        builder.seal_block(header_block);
+        self.seal_block(ctx, builder, body_block);
+        self.seal_block(ctx, builder, header_block);
 
         // Pop loop context
         ctx.pop_loop();
 
         // Switch to follow block
-        builder.switch_to_block(follow_block);
-        builder.ins().nop(); // Ensure follow block has an instruction
-        builder.seal_block(follow_block);
+        self.switch_to_block(ctx, builder, follow_block);
 
         Ok(())
     }
@@ -693,27 +701,27 @@ impl CodeGenerator {
             BinaryOp::Modulo => Ok(builder.ins().srem(left, right)),
             BinaryOp::Equal => {
                 let cmp = builder.ins().icmp(IntCC::Equal, left, right);
-                Ok(builder.ins().bmask(left_ty, cmp))
+                Ok(cmp)
             }
             BinaryOp::NotEqual => {
                 let cmp = builder.ins().icmp(IntCC::NotEqual, left, right);
-                Ok(builder.ins().bmask(left_ty, cmp))
+                Ok(cmp)
             }
             BinaryOp::LessThan => {
                 let cmp = builder.ins().icmp(IntCC::SignedLessThan, left, right);
-                Ok(builder.ins().bmask(left_ty, cmp))
+                Ok(cmp)
             }
             BinaryOp::LessThanOrEqual => {
                 let cmp = builder.ins().icmp(IntCC::SignedLessThanOrEqual, left, right);
-                Ok(builder.ins().bmask(left_ty, cmp))
+                Ok(cmp)
             }
             BinaryOp::GreaterThan => {
                 let cmp = builder.ins().icmp(IntCC::SignedGreaterThan, left, right);
-                Ok(builder.ins().bmask(left_ty, cmp))
+                Ok(cmp)
             }
             BinaryOp::GreaterThanOrEqual => {
                 let cmp = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, left, right);
-                Ok(builder.ins().bmask(left_ty, cmp))
+                Ok(cmp)
             }
             BinaryOp::And => Ok(builder.ins().band(left, right)),
             BinaryOp::Or => Ok(builder.ins().bor(left, right)),
@@ -1129,7 +1137,7 @@ impl CodeGenerator {
     ) -> Result<i32, CompileError> {
         let array_type = self.get_expr_type(ctx, array_expr)?;
         if let AstType::Array(element_type, _) = array_type {
-            self.get_type_size(&element_type)
+            self.get_type_size(&element_type)?
         } else {
             Err(CompileError::UnsupportedType(format!(
                 "Expected array type, found {:?}",
@@ -1197,29 +1205,87 @@ impl CodeGenerator {
     }
 
     // Helper methods for block handling
-    fn ensure_block_has_instruction(&self, builder: &mut FunctionBuilder) {
-        builder.ins().nop();
+    fn ensure_block_has_instruction(&self, ctx: &CodeGenContext, builder: &mut FunctionBuilder) {
+        if let Some(block) = ctx.current_block {
+            if !ctx.is_block_terminated(block) && ctx.is_block_empty(block) {
+                builder.ins().nop();
+            }
+        }
     }
 
-    fn switch_to_block(&mut self, ctx: &mut CodeGenContext, builder: &mut FunctionBuilder, 
-                      block: cranelift::prelude::Block) {
-        // Ensure current block is properly terminated
-        let current = builder.current_block().unwrap();
-        if !ctx.is_block_terminated(current) {
-            builder.ins().nop();
+    fn switch_to_block(&mut self, ctx: &mut CodeGenContext, builder: &mut FunctionBuilder, block: Block) {
+        // Ensure current block is properly terminated if it exists
+        if let Some(current_block) = ctx.current_block {
+            if !ctx.is_block_terminated(current_block) {
+                self.ensure_block_has_instruction(ctx, builder);
+            }
+        }
+        
+        // Register the new block if it's not already registered
+        if ctx.get_block_info(block).is_none() {
+            ctx.register_block(block);
         }
         
         // Switch to new block
         builder.switch_to_block(block);
-        self.ensure_block_has_instruction(builder);
+        ctx.set_current_block(block);
+        
+        // Only add nop if the block is completely empty
+        if ctx.is_block_empty(block) {
+            builder.ins().nop();
+        }
     }
 
     fn terminate_block(&mut self, ctx: &mut CodeGenContext, builder: &mut FunctionBuilder, 
-                      from_block: cranelift::prelude::Block, to_block: cranelift::prelude::Block) {
+                      from_block: Block, to_block: Block) {
         if !ctx.is_block_terminated(from_block) {
-            self.ensure_block_has_instruction(builder);
+            self.ensure_block_has_instruction(ctx, builder);
             builder.ins().jump(to_block, &[]);
             ctx.mark_block_terminated(from_block);
+        }
+    }
+
+    fn seal_block(&mut self, ctx: &mut CodeGenContext, builder: &mut FunctionBuilder, block: Block) {
+        if !ctx.is_block_sealed(block) {
+            if let Some(info) = ctx.get_block_info(block) {
+                for (&var_idx, &value) in info.phi_nodes.iter() {
+                    let var = Variable::new(var_idx);
+                    builder.def_var(var, value);
+                }
+            }
+            
+            builder.seal_block(block);
+            ctx.mark_block_sealed(block);
+        }
+    }
+
+    // Add this helper method to capture IR
+    fn capture_ir(&mut self, context: &Context) {
+        let mut ir_string = String::new();
+        writeln!(ir_string, "Function IR:").unwrap();
+        writeln!(ir_string, "{}", context.func.display()).unwrap();
+        self.last_ir = Some(ir_string);
+    }
+
+    fn handle_break(&mut self, ctx: &mut CodeGenContext, builder: &mut FunctionBuilder) -> Result<(), CompileError> {
+        if let Some(loop_ctx) = ctx.loop_stack.last().cloned() {
+            self.ensure_block_has_instruction(ctx, builder);
+            builder.ins().jump(loop_ctx.exit_block, &[]);
+            ctx.mark_block_terminated(builder.current_block().unwrap());
+            Ok(())
+        } else {
+            Err(CompileError::InvalidBreak)
+        }
+    }
+
+    fn handle_continue(&mut self, ctx: &mut CodeGenContext, builder: &mut FunctionBuilder) -> Result<(), CompileError> {
+        if let Some(loop_ctx) = ctx.loop_stack.last().cloned() {
+            self.ensure_block_has_instruction(ctx, builder);
+            builder.ins().jump(loop_ctx.header_block, &[]);
+            ctx.mark_block_terminated(builder.current_block().unwrap());
+            Ok(())
+        } else {
+            Err(CompileError::InvalidContinue)
         }
     }
 }
@@ -1248,6 +1314,7 @@ pub fn create_jit_code_generator() -> Result<CodeGenerator, CompileError> {
         string_data: HashMap::new(),
         structs: HashMap::new(),
         globals: HashMap::new(),
+        last_ir: None,
     })
 }
 
@@ -1275,6 +1342,7 @@ pub fn create_object_code_generator() -> Result<CodeGenerator, CompileError> {
         string_data: HashMap::new(),
         structs: HashMap::new(),
         globals: HashMap::new(),
+        last_ir: None,
     })
 }
 
@@ -1284,8 +1352,12 @@ impl CodeGenContext {
             terminated_blocks: HashSet::new(),
             current_function: None,
             next_var_index: 0,
-            scopes: vec![HashMap::new()],
+            scopes: vec![ScopeInfo {
+                variables: HashMap::new(),
+                block_info: HashMap::new(),
+            }],
             loop_stack: Vec::new(),
+            current_block: None,
         }
     }
 
@@ -1295,37 +1367,43 @@ impl CodeGenContext {
         let var_info = VarInfo { var, typ };
         
         if let Some(current_scope) = self.scopes.last_mut() {
-            current_scope.insert(name, var_info);
+            current_scope.variables.insert(name, var_info);
         }
         var
     }
 
     fn get_variable(&self, name: &str) -> Option<&VarInfo> {
         for scope in self.scopes.iter().rev() {
-            if let Some(var_info) = scope.get(name) {
+            if let Some(var_info) = scope.variables.get(name) {
                 return Some(var_info);
             }
         }
         None
     }
 
-    fn mark_block_terminated(&mut self, block: cranelift::prelude::Block) {
+    fn mark_block_terminated(&mut self, block: Block) {
+        if let Some(info) = self.get_block_info_mut(block) {
+            info.has_terminator = true;
+        }
         self.terminated_blocks.insert(block);
     }
 
-    fn is_block_terminated(&self, block: cranelift::prelude::Block) -> bool {
-        self.terminated_blocks.contains(&block)
+    fn is_block_terminated(&self, block: Block) -> bool {
+        self.get_block_info(block).map_or(false, |info| info.has_terminator)
     }
 
     fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(ScopeInfo {
+            variables: HashMap::new(),
+            block_info: HashMap::new(),
+        });
     }
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
     }
 
-    fn push_loop(&mut self, header: cranelift::prelude::Block, exit: cranelift::prelude::Block) {
+    fn push_loop(&mut self, header: Block, exit: Block) {
         self.loop_stack.push(LoopContext {
             header_block: header,
             exit_block: exit,
@@ -1338,6 +1416,57 @@ impl CodeGenContext {
 
     fn current_loop(&self) -> Option<&LoopContext> {
         self.loop_stack.last()
+    }
+
+    fn register_block(&mut self, block: Block) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.block_info.insert(block, BlockInfo {
+                block,
+                sealed: false,
+                has_terminator: false,
+                phi_nodes: HashMap::new(),
+                instruction_count: 0,
+            });
+        }
+    }
+
+    fn set_current_block(&mut self, block: Block) {
+        self.current_block = Some(block);
+    }
+
+    fn get_block_info(&self, block: Block) -> Option<&BlockInfo> {
+        self.scopes.last()?.block_info.get(&block)
+    }
+
+    fn get_block_info_mut(&mut self, block: Block) -> Option<&mut BlockInfo> {
+        self.scopes.last_mut()?.block_info.get_mut(&block)
+    }
+
+    fn mark_block_sealed(&mut self, block: Block) {
+        if let Some(info) = self.get_block_info_mut(block) {
+            info.sealed = true;
+        }
+    }
+
+    fn is_block_sealed(&self, block: Block) -> bool {
+        self.get_block_info(block).map_or(false, |info| info.sealed)
+    }
+
+    fn add_phi_node(&mut self, block: Block, var: Variable, value: Value) {
+        if let Some(info) = self.get_block_info_mut(block) {
+            info.phi_nodes.insert(var.index(), value);
+        }
+    }
+
+    fn increment_block_instructions(&mut self, block: Block) {
+        if let Some(info) = self.get_block_info_mut(block) {
+            info.instruction_count += 1;
+        }
+    }
+
+    fn is_block_empty(&self, block: Block) -> bool {
+        self.get_block_info(block)
+            .map_or(true, |info| info.instruction_count == 0)
     }
 }
 
